@@ -226,7 +226,7 @@ func (s *Service) handlePendingInterviewReply(ctx context.Context, msg Message, 
 	if len(s.allowedUsers) == 0 {
 		return
 	}
-	role, ok := s.allowedUsers[msg.AuthorID]
+	role, ok := s.allowedUserRole(msg.AuthorID)
 	if !ok || !config.RoleAtLeast(role, config.RoleOwner) {
 		return
 	}
@@ -268,12 +268,16 @@ func (p *pendingInterview) lowestUnanswered() (inceptionQuestion, bool) {
 	return inceptionQuestion{}, false
 }
 
+// pendingKey keys a pending interview by config.IdentityMatchKey(author):
+// seeding walks the configured allowlist identities while replies carry the
+// transport's author ID, and the two must meet the same way the allowlist
+// lookup (allowedUserRole) matches them.
 func (s *Service) pendingKey(author string) pendingInterviewKey {
 	backend := ""
 	if s.backend != nil {
 		backend = s.backend.Name()
 	}
-	return pendingInterviewKey{backend: backend, author: author}
+	return pendingInterviewKey{backend: backend, author: config.IdentityMatchKey(author)}
 }
 
 func (s *Service) diffInception(prev, cur *statusSnapshot) {
@@ -301,15 +305,15 @@ func (s *Service) seedPendingInterviews(questions []inceptionQuestion, answers m
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for author, role := range s.allowedUsers {
-		if !config.RoleAtLeast(role, config.RoleOwner) {
+	for _, user := range s.allowedUsers {
+		if !config.RoleAtLeast(user.role, config.RoleOwner) {
 			continue
 		}
 		cpAnswers := make(map[string]string, len(answers))
 		for k, v := range answers {
 			cpAnswers[k] = v
 		}
-		s.pendingInterviews[s.pendingKey(author)] = &pendingInterview{
+		s.pendingInterviews[s.pendingKey(user.id)] = &pendingInterview{
 			Questions: append([]inceptionQuestion(nil), questions...),
 			Answers:   cpAnswers,
 		}

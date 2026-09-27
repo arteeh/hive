@@ -126,7 +126,7 @@ type Service struct {
 	backend           Backend
 	dashboardURL      string
 	dashboardToken    string
-	allowedUsers      map[string]string
+	allowedUsers      map[string]allowedUser
 	commands          map[string]CommandHandler
 	agentNames        []string
 	mu                sync.RWMutex
@@ -160,13 +160,7 @@ type msgItem struct {
 }
 
 func NewService(backend Backend, cfg Config, logger *slog.Logger) *Service {
-	allowed := make(map[string]string, len(cfg.AllowedUsers))
-	for i, entry := range cfg.AllowedUsers {
-		id, role := parseAllowedUser(entry, i)
-		if id != "" {
-			allowed[id] = role
-		}
-	}
+	allowed := parseAllowedUsers(cfg.AllowedUsers)
 	messageLimit := cfg.MessageLimit
 	if messageLimit == 0 {
 		messageLimit = defaultMessageLimit
@@ -209,6 +203,38 @@ func NewService(backend Backend, cfg Config, logger *slog.Logger) *Service {
 		expandedRuns:       make(map[personaRunKey]struct{}),
 		shownSummaries:     make(map[personaRunKey]struct{}),
 	}
+}
+
+// allowedUser is one chat allowlist entry: the identity as configured (role
+// suffix stripped) and its role. Per-author prompts and persona lookups use id
+// unchanged; lookups by message author go through allowedUserRole.
+type allowedUser struct {
+	id   string
+	role string
+}
+
+// parseAllowedUsers keys the allowlist by config.IdentityMatchKey so the spine
+// resolves an author the same way the dashboard's AuthorizedRole does
+// (case-insensitive, "github:alice" == "alice"). As there, the first entry for
+// an identity wins.
+func parseAllowedUsers(entries []string) map[string]allowedUser {
+	allowed := make(map[string]allowedUser, len(entries))
+	for i, entry := range entries {
+		id, role := parseAllowedUser(entry, i)
+		if id == "" {
+			continue
+		}
+		key := config.IdentityMatchKey(id)
+		if _, dup := allowed[key]; !dup {
+			allowed[key] = allowedUser{id: id, role: role}
+		}
+	}
+	return allowed
+}
+
+func (s *Service) allowedUserRole(author string) (string, bool) {
+	user, ok := s.allowedUsers[config.IdentityMatchKey(author)]
+	return user.role, ok
 }
 
 func parseAllowedUser(entry string, index int) (string, string) {

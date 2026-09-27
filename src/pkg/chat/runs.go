@@ -371,7 +371,7 @@ func (s *Service) handlePendingCheckpointReply(ctx context.Context, msg Message,
 	if len(s.allowedUsers) == 0 {
 		return false
 	}
-	role, ok := s.allowedUsers[msg.AuthorID]
+	role, ok := s.allowedUserRole(msg.AuthorID)
 	if !ok {
 		return false
 	}
@@ -432,11 +432,15 @@ func (s *Service) handlePendingCheckpointReply(ctx context.Context, msg Message,
 	return true
 }
 
+// pendingCheckpointsForAuthor matches author against each checkpoint's
+// configured owner identities by config.IdentityMatchKey, the same way the
+// allowlist lookup (allowedUserRole) resolved the author's role.
 func (s *Service) pendingCheckpointsForAuthor(author string) []*pendingCheckpoint {
 	backend := ""
 	if s.backend != nil {
 		backend = s.backend.Name()
 	}
+	want := config.IdentityMatchKey(author)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var out []*pendingCheckpoint
@@ -444,9 +448,12 @@ func (s *Service) pendingCheckpointsForAuthor(author string) []*pendingCheckpoin
 		if key.backend != backend {
 			continue
 		}
-		if _, ok := checkpoint.Authors[author]; ok {
-			cp := *checkpoint
-			out = append(out, &cp)
+		for owner := range checkpoint.Authors {
+			if config.IdentityMatchKey(owner) == want {
+				cp := *checkpoint
+				out = append(out, &cp)
+				break
+			}
 		}
 	}
 	return out
@@ -536,9 +543,9 @@ func checkpointTechnicalSummary(payload runCheckpointPayload) string {
 
 func (s *Service) ownerAuthors() map[string]struct{} {
 	authors := map[string]struct{}{}
-	for author, role := range s.allowedUsers {
-		if config.RoleAtLeast(role, config.RoleOwner) {
-			authors[author] = struct{}{}
+	for _, user := range s.allowedUsers {
+		if config.RoleAtLeast(user.role, config.RoleOwner) {
+			authors[user.id] = struct{}{}
 		}
 	}
 	return authors

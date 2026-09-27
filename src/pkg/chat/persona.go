@@ -116,7 +116,7 @@ func (s *Service) handlePendingPersonaReply(ctx context.Context, msg Message, co
 	if len(s.allowedUsers) == 0 {
 		return false
 	}
-	if _, ok := s.allowedUsers[msg.AuthorID]; !ok {
+	if _, ok := s.allowedUserRole(msg.AuthorID); !ok {
 		return false
 	}
 	key := s.pendingPersonaKey(msg.AuthorID)

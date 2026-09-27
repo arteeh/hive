@@ -94,7 +94,7 @@ func (s *Service) routeMessage(ctx context.Context, msg Message) {
 			"user_id", msg.AuthorID, "content", content)
 		return
 	}
-	role, ok := s.allowedUsers[msg.AuthorID]
+	role, ok := s.allowedUserRole(msg.AuthorID)
 	if !ok {
 		s.logger.Warn("discord: ignoring command from non-allowlisted user",
 			"user_id", msg.AuthorID, "content", content)
