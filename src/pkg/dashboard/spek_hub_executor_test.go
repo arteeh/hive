@@ -397,12 +397,19 @@ func TestSpekHubExecutorFailureRecordsAuditTimelineAndBudget(t *testing.T) {
 	}
 }
 
-func TestSpekHubExecutorEnvUsesIsolatedHomeAndAppToken(t *testing.T) {
+func TestSpekHubExecutorEnvUsesAllowlistedValuesAndRunToken(t *testing.T) {
 	_, s, _, _ := spekHub(t)
 	t.Setenv("GITHUB_TOKEN", "old")
 	t.Setenv("GH_TOKEN", "old")
+	t.Setenv("HIVE_HUB_TOKEN", "hub-token")
+	t.Setenv("HIVE_DASHBOARD_TOKEN", "dashboard-token")
+	t.Setenv("UNLISTED_VALUE", "drop-me")
+	t.Setenv("PATH", "/usr/bin")
+	t.Setenv("LANG", "C.UTF-8")
+	t.Setenv("LC_ALL", "C.UTF-8")
+	t.Setenv("HTTPS_PROXY", "http://proxy.example")
 	e := NewSpekHubExecutor(s, config.RunsConfig{Spektacular: config.SpektacularConfig{Enabled: true}}, "copilot", "", nil, nil)
-	env, err := e.executorEnv("app-token")
+	env, err := e.executorEnv("readonly-run-token")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,8 +421,16 @@ func TestSpekHubExecutorEnvUsesIsolatedHomeAndAppToken(t *testing.T) {
 	if byKey["HOME"] != filepath.Join(agentWorkspaceRoot, e.Identity, "home") {
 		t.Fatalf("HOME = %q", byKey["HOME"])
 	}
-	if byKey["GH_TOKEN"] != "app-token" || byKey["GITHUB_TOKEN"] != "app-token" {
-		t.Fatalf("github tokens not overridden: GH=%q GITHUB=%q", byKey["GH_TOKEN"], byKey["GITHUB_TOKEN"])
+	if byKey["PATH"] != "/usr/bin" || byKey["LANG"] != "C.UTF-8" || byKey["LC_ALL"] != "C.UTF-8" || byKey["HTTPS_PROXY"] != "http://proxy.example" {
+		t.Fatalf("expected allowlisted process values, got PATH=%q LANG=%q LC_ALL=%q HTTPS_PROXY=%q", byKey["PATH"], byKey["LANG"], byKey["LC_ALL"], byKey["HTTPS_PROXY"])
+	}
+	if byKey["GH_TOKEN"] != "readonly-run-token" || byKey["GITHUB_TOKEN"] != "readonly-run-token" {
+		t.Fatalf("run tokens not set from clone token: GH=%q GITHUB=%q", byKey["GH_TOKEN"], byKey["GITHUB_TOKEN"])
+	}
+	for _, key := range []string{"HIVE_HUB_TOKEN", "HIVE_DASHBOARD_TOKEN", "UNLISTED_VALUE"} {
+		if _, ok := byKey[key]; ok {
+			t.Fatalf("%s reached child env", key)
+		}
 	}
 }
 

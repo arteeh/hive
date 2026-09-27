@@ -1041,7 +1041,7 @@ func (e *SpekHubExecutor) executorEnv(appToken string) ([]string, error) {
 	if err := os.MkdirAll(home, 0o755); err != nil {
 		return nil, err
 	}
-	env := filteredSpekEnv(os.Environ(), "HOME", "npm_config_cache", "GH_TOKEN", "GITHUB_TOKEN")
+	env := allowedSpekHubExecutorEnv(os.Environ())
 	env = spekGitEnv(env)
 	env = append(env, "HOME="+home, "npm_config_cache="+filepath.Join(home, ".npm-cache"))
 	creds, err := agent.HeadlessCredentialEnv(e.backend())
@@ -1054,6 +1054,28 @@ func (e *SpekHubExecutor) executorEnv(appToken string) ([]string, error) {
 		env = append(env, "GH_TOKEN="+tok, "GITHUB_TOKEN="+tok)
 	}
 	return env, nil
+}
+
+func allowedSpekHubExecutorEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		if spekHubExecutorEnvAllowed(key) {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func spekHubExecutorEnvAllowed(key string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(key))
+	switch upper {
+	case "PATH", "LANG", "LANGUAGE", "TERM", "TZ", "NPM_CONFIG_CACHE":
+		return true
+	case "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY":
+		return true
+	}
+	return strings.HasPrefix(upper, "LC_")
 }
 
 // spekGitEnv marks the executor's own workspace root as a safe git directory.
