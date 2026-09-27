@@ -49,6 +49,9 @@ func (s *Service) routeMessage(ctx context.Context, msg Message) {
 		return
 	}
 
+	// Carry identity through commands and conversational checkpoint replies.
+	ctx = context.WithValue(ctx, commandAuthorContextKey{}, msg.AuthorID)
+
 	content := strings.TrimSpace(msg.Text)
 	safeContent, verdict := ioscan.EnforceInput(content)
 	if verdict.Blocked {
@@ -88,7 +91,6 @@ func (s *Service) routeMessage(ctx context.Context, msg Message) {
 		return
 	}
 	ctx = context.WithValue(ctx, commandRoleContextKey{}, role)
-	ctx = context.WithValue(ctx, commandAuthorContextKey{}, msg.AuthorID)
 
 	content = content[1:]
 

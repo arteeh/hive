@@ -214,6 +214,9 @@ func (s *Service) dashboardGet(ctx context.Context, path string) ([]byte, error)
 	}
 	if s.dashboardToken != "" {
 		req.Header.Set("Authorization", "Bearer "+s.dashboardToken)
+		if author, _ := ctx.Value(commandAuthorContextKey{}).(string); author != "" && s.backend != nil {
+			req.Header.Set("X-Hive-Chat-Actor", s.backend.Name()+":"+author)
+		}
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -239,6 +242,9 @@ func (s *Service) dashboardPost(ctx context.Context, path string, body []byte) e
 	req.Header.Set("Content-Type", "application/json")
 	if s.dashboardToken != "" {
 		req.Header.Set("Authorization", "Bearer "+s.dashboardToken)
+		if author, _ := ctx.Value(commandAuthorContextKey{}).(string); author != "" && s.backend != nil {
+			req.Header.Set("X-Hive-Chat-Actor", s.backend.Name()+":"+author)
+		}
 	}
 
 	resp, err := s.client.Do(req)
