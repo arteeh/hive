@@ -1,12 +1,15 @@
 package notify
 
 import (
+	"bytes"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/logscrub"
 )
 
 func TestSendNtfyErrorStatus(t *testing.T) {
@@ -127,6 +130,48 @@ func TestSendDiscordNetworkError(t *testing.T) {
 		Discord: &config.DiscordConfig{Webhook: "http://127.0.0.1:1/discord"},
 	}, slog.Default())
 	n.sendDiscordWebhook("Test", "message")
+}
+
+func TestWebhookSendErrorOmitsRequestPath(t *testing.T) {
+	const hookPath = "/services/T00000000/B00000000/abcdefghijklmnopqrstuvwx"
+	cases := []struct {
+		name    string
+		handler func(*bytes.Buffer) slog.Handler
+	}{
+		{
+			name: "plain",
+			handler: func(buf *bytes.Buffer) slog.Handler {
+				return slog.NewJSONHandler(buf, nil)
+			},
+		},
+		{
+			name: "wrapped",
+			handler: func(buf *bytes.Buffer) slog.Handler {
+				return logscrub.NewHandler(slog.NewJSONHandler(buf, nil))
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			n := New(config.NotificationsConfig{
+				Slack: &config.SlackConfig{Webhook: "http://127.0.0.1:1" + hookPath},
+			}, slog.New(tc.handler(&buf)))
+
+			n.sendSlack("Test", "message")
+
+			logged := buf.String()
+			if logged == "" {
+				t.Fatal("expected a send error log line")
+			}
+			if strings.Contains(logged, hookPath) || strings.Contains(logged, "abcdefghijklmnopqrstuvwx") {
+				t.Fatalf("send error log included request path: %s", logged)
+			}
+			if !strings.Contains(logged, `"webhook_host"`) {
+				t.Fatalf("send error log missing redacted host field: %s", logged)
+			}
+		})
+	}
 }
 
 func TestSendNtfyNetworkError(t *testing.T) {
