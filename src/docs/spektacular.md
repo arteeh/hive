@@ -19,6 +19,18 @@ Spek campaign does not copy spek contents into Hive; `POST
 command, while Spek reloads the current state from its working files and
 spek backend.
 
+## Polling and timeouts
+
+The hub polls stages on a separate serial worker every 30 seconds. Slow polls
+coalesce instead of delaying contributor lease cleanup or websocket sweeps.
+Each poll has a 30-second budget; shutdown cancels the active poll. Agent jobs
+launched by the hub executor retain their configured stage execution timeout.
+
+Each CLI call through the stage runner's `BinaryExec` has a 30-second deadline
+(or the caller's earlier deadline), plus at most one second to drain inherited
+output pipes. Timeout errors retain partial stdout and report the context
+error. A poll stops visiting further stages once its context is canceled.
+
 ## Work sources
 
 Spek runs can start from any configured Hive work source. GitHub Issues and

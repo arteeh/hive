@@ -4603,6 +4603,19 @@ func (h *ContributeWSHub) cleanupLoop() {
 	if h.doneCh != nil {
 		defer close(h.doneCh)
 	}
+	// The stage worker has its own clock: CLI latency must not stall cleanup.
+	ctx, cancel := context.WithCancel(context.Background())
+	stageTicker := time.NewTicker(30 * time.Second)
+	stageDone := make(chan struct{})
+	go func() {
+		defer close(stageDone)
+		stageRunnerLoop(ctx, stageTicker.C, func() *Server { return h.server })
+	}()
+	defer func() {
+		cancel()
+		stageTicker.Stop()
+		<-stageDone
+	}()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -4616,13 +4629,6 @@ func (h *ContributeWSHub) cleanupLoop() {
 			// "connected but wedged" case the issue describes; this releases its task
 			// through the SAME cooldown+generation-bump path a manual requeue uses.
 			h.reclaimExpiredLeases(time.Now())
-
-			// #8303: drive the installed stage runner (advance on final, retry or
-			// escalate on expiry). Nothing is installed unless
-			// runs.spektacular.enabled was set at boot.
-			if h.server != nil {
-				h.server.tickStageRunner(time.Now())
-			}
 
 			// A run stage waiting on a taker must outlive leaseTTL; extend those
 			// BEFORE the prune below can drop them.

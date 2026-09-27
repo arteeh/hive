@@ -1310,3 +1310,67 @@ func TestRunStageAccessorAutoApprovesDisabledImplementCheckpoint(t *testing.T) {
 		t.Fatalf("auto implement approval audit not recorded: %+v", s.audit.Recent(10))
 	}
 }
+
+type blockingStageRunner struct{ started chan context.Context }
+
+func (r *blockingStageRunner) Tick(ctx context.Context, _ time.Time) {
+	r.started <- ctx
+	<-ctx.Done()
+}
+
+func TestStageRunnerWorker_CancelsAndSerializes(t *testing.T) {
+	s := &Server{}
+	r := &blockingStageRunner{started: make(chan context.Context, 2)}
+	s.SetStageRunner(r)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ticks := make(chan time.Time, 1)
+	done := make(chan struct{})
+	go func() { defer close(done); stageRunnerLoop(ctx, ticks, func() *Server { return s }) }()
+	ticks <- time.Now()
+	select {
+	case tickCtx := <-r.started:
+		if deadline, ok := tickCtx.Deadline(); !ok || time.Until(deadline) > 30*time.Second {
+			t.Fatal("tick has no bounded deadline")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start")
+	}
+	// A blocked runner does not block the producer or start overlapping ticks.
+	ticks <- time.Now()
+	select {
+	case <-r.started:
+		t.Fatal("overlapping tick")
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not cancel its active tick on shutdown")
+	}
+}
+
+type contextStageExecutor struct{ ctx context.Context }
+
+func (e *contextStageExecutor) Tick(ctx context.Context, _ time.Time) { e.ctx = ctx }
+func (e *contextStageExecutor) Status() FrontendSpektacularHubExecutor {
+	return FrontendSpektacularHubExecutor{}
+}
+
+func TestStageRunner_PollDoesNotCancelExecutorJobs(t *testing.T) {
+	s := &Server{}
+	e := &contextStageExecutor{}
+	s.SetStageExecutor(e)
+	s.SetStageRunner(&countingRunner{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.tickStageRunnerContext(ctx, time.Now())
+	if e.ctx == nil || e.ctx.Err() != nil {
+		t.Fatal("poll completion canceled executor jobs")
+	}
+	cancel()
+	if e.ctx.Err() != context.Canceled {
+		t.Fatal("executor jobs lost lifecycle cancellation")
+	}
+}
