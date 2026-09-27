@@ -16,7 +16,8 @@ import (
 )
 
 const (
-	discordAPIBase = "https://discord.com/api/v10"
+	discordAPIBase        = "https://discord.com/api/v10"
+	discordSuppressEmbeds = 1 << 2
 
 	httpTimeoutS  = 10
 	pollIntervalS = 5
@@ -122,7 +123,11 @@ func (b *discordBackend) Name() string {
 
 func (b *discordBackend) Send(content string) error {
 	content = logscrub.ScrubString(content)
-	payload := map[string]string{"content": content}
+	payload := map[string]any{
+		"content":          content,
+		"allowed_mentions": map[string]any{"parse": []string{}},
+		"flags":            discordSuppressEmbeds,
+	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
