@@ -137,6 +137,7 @@ type Service struct {
 	heartbeatInterval time.Duration
 	sseReconnectBase  time.Duration
 	sseReconnectMax   time.Duration
+	sseIdleTimeout    time.Duration
 	personaStore      PersonaStore
 	personaLearning   func() persona.LearningConfig
 	audit             agentaudit.AuditSink
@@ -198,6 +199,7 @@ func NewService(backend Backend, cfg Config, logger *slog.Logger) *Service {
 		heartbeatInterval:  heartbeatInterval,
 		sseReconnectBase:   sseReconnectBase,
 		sseReconnectMax:    sseReconnectMax,
+		sseIdleTimeout:     sseIdleTimeout,
 		personaStore:       personaStore,
 		personaLearning:    cfg.PersonaLearning,
 		audit:              cfg.AuditSink,

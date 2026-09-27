@@ -7,15 +7,19 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	agentpkg "github.com/hivecommons/hive/pkg/agent"
 )
 
 const (
-	topicDebounceMS  = 5000
-	sseReconnectBase = 5 * time.Second
-	sseReconnectMax  = 60 * time.Second
+	topicDebounceMS          = 5000
+	sseReconnectBase         = 5 * time.Second
+	sseReconnectMax          = 60 * time.Second
+	sseIdleTimeout           = 2 * time.Minute
+	sseResponseHeaderTimeout = 30 * time.Second
+	sseMaxBufferBytes        = 1 << 20
 )
 
 type statusSnapshot struct {
@@ -90,7 +94,9 @@ func (s *Service) sseLoop(ctx context.Context) {
 
 func (s *Service) consumeSSE(ctx context.Context) (bool, error) {
 	url := s.dashboardURL + "/api/events"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return false, err
 	}
@@ -98,7 +104,9 @@ func (s *Service) consumeSSE(ctx context.Context) (bool, error) {
 		req.Header.Set("Authorization", "Bearer "+s.dashboardToken)
 	}
 
-	sseClient := &http.Client{Timeout: 0}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = sseResponseHeaderTimeout
+	sseClient := &http.Client{Transport: transport}
 	resp, err := sseClient.Do(req)
 	if err != nil {
 		return false, err
@@ -108,6 +116,41 @@ func (s *Service) consumeSSE(ctx context.Context) (bool, error) {
 	if resp.StatusCode != http.StatusOK {
 		return false, fmt.Errorf("SSE status %d", resp.StatusCode)
 	}
+
+	idleTimeout := s.sseIdleTimeout
+	if idleTimeout == 0 {
+		idleTimeout = sseIdleTimeout
+	}
+	activity := make(chan struct{}, 1)
+	var idleExpired atomic.Bool
+	watchdogDone := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		timer := time.NewTimer(idleTimeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-timer.C:
+				idleExpired.Store(true)
+				cancel()
+				return
+			case <-activity:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(idleTimeout)
+			case <-streamCtx.Done():
+				return
+			}
+		}
+	}()
+	defer func() {
+		cancel()
+		<-watchdogDone
+	}()
 
 	buf := make([]byte, 4096)
 	var buffer string
@@ -133,9 +176,19 @@ func (s *Service) consumeSSE(ctx context.Context) (bool, error) {
 						}
 					}
 				}
+				select {
+				case activity <- struct{}{}:
+				default:
+				}
+			}
+			if len(buffer) > sseMaxBufferBytes {
+				return true, fmt.Errorf("SSE frame buffer exceeded %d bytes", sseMaxBufferBytes)
 			}
 		}
 		if err != nil {
+			if idleExpired.Load() {
+				return true, fmt.Errorf("SSE idle timeout after %s", idleTimeout)
+			}
 			return true, err
 		}
 	}
