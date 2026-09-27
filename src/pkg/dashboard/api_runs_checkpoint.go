@@ -106,21 +106,30 @@ func (s *Server) handleRunCheckpointDecision(w http.ResponseWriter, r *http.Requ
 	}
 	switch action {
 	case runCheckpointDecisionApprove:
-		if epic, err := store.Get(payload.PlanEpicID); err == nil && epic.Meta(planning.MetaDesignVia) == planning.DesignViaSpektacular && planning.DesignStatus(epic) != planning.DesignStatusApproved {
+		if payload.Stage == StageSpec {
+			epic, err := store.Get(payload.PlanEpicID)
+			if err != nil || planning.DesignStatus(epic) == "" {
+				jsonError(w, "checkpoint design not found", http.StatusBadRequest)
+				return
+			}
+			// Commit the lease transition before publishing approval. A failed
+			// GitHub signal must never leave an approved design parked at spec.
+			runKey := s.runKeyForEpic(epic.Meta(planning.MetaIssueRepo), epic.Meta(planning.MetaIssueNumber), epic.Meta(planning.MetaRunKey))
+			if err := s.advanceApprovedSpecLease(runKey, payload.PlanEpicID, requestUser(r), time.Now(), req.Gen); err != nil {
+				jsonError(w, err.Error(), http.StatusConflict)
+				return
+			}
 			if err := planning.ApproveDesign(store, payload.PlanEpicID); err != nil {
-				jsonError(w, err.Error(), http.StatusBadRequest)
+				jsonError(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 			if s.deps != nil && s.deps.GHClient != nil {
 				if err := s.applyDesignSignal(r.Context(), issueFromEpic(epic), s.designConfig().ApprovedLabelOrDefault(), s.designApprovedStatus()); err != nil {
-					jsonError(w, err.Error(), http.StatusBadGateway)
-					return
+					s.LifecycleTimeline().Record(timeline.Event{
+						IssueRef: payload.RunKey, Kind: timeline.KindProgress, Agent: requestUser(r),
+						Attrs: map[string]string{"stage": StageSpec, "design_signal_error": err.Error()},
+					})
 				}
-			}
-			runKey := s.runKeyForEpic(epic.Meta(planning.MetaIssueRepo), epic.Meta(planning.MetaIssueNumber), epic.Meta(planning.MetaRunKey))
-			if err := s.advanceApprovedSpecLease(runKey, payload.PlanEpicID, requestUser(r), time.Now()); err != nil {
-				jsonError(w, err.Error(), http.StatusConflict)
-				return
 			}
 			s.auditFromRequest(r, "design_approved", auditDetail("epic", payload.PlanEpicID, "run", payload.RunKey, "surface", "run_checkpoint"), agentName)
 			break
@@ -135,7 +144,7 @@ func (s *Server) handleRunCheckpointDecision(w http.ResponseWriter, r *http.Requ
 		}
 		s.auditFromRequest(r, "plan_approve", auditDetail("epic", payload.PlanEpicID, "run", payload.RunKey, "surface", "run_checkpoint"), agentName)
 	case runCheckpointDecisionReject:
-		if epic, err := store.Get(payload.PlanEpicID); err == nil && epic.Meta(planning.MetaDesignVia) == planning.DesignViaSpektacular && planning.DesignStatus(epic) != planning.DesignStatusApproved {
+		if payload.Stage == StageSpec {
 			if err := store.SetMetadata(payload.PlanEpicID, planning.MetaDesignStatus, planning.DesignStatusQueued); err != nil {
 				jsonError(w, err.Error(), http.StatusBadRequest)
 				return
@@ -243,7 +252,11 @@ func (s *Server) runCheckpointRun(key string) (Run, error) {
 		if run.Key != key && run.LeaseKey != key {
 			continue
 		}
-		if run.WaitingOn != RunWaitingOnHuman || run.PlanEpicID == "" {
+		// Recover approvals persisted by older versions before their GitHub
+		// signal or lease advance failed. The live spec lease is still the
+		// generation fence; never reinterpret this as a plan approval.
+		recoverSpec := run.Stage == StageSpec && s.runSpecApproved(run.Key)
+		if (run.WaitingOn != RunWaitingOnHuman && !recoverSpec) || run.PlanEpicID == "" {
 			return Run{}, errRunCheckpointNotHeld
 		}
 		return run, nil

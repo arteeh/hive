@@ -1358,7 +1358,7 @@ func (s *Server) runPlanSnapshots() map[string]runPlanSnapshot {
 			continue
 		}
 		for _, b := range store.List(beads.ListFilter{}) {
-			if b.Type != beads.TypeEpic || b.Meta(planning.MetaPlanStatus) == "" {
+			if b.Type != beads.TypeEpic || (b.Meta(planning.MetaPlanStatus) == "" && b.Meta(planning.MetaDesignVia) != planning.DesignViaSpektacular) {
 				continue
 			}
 			repo, number, runKey := b.Meta(planning.MetaIssueRepo), b.Meta(planning.MetaIssueNumber), b.Meta(planning.MetaRunKey)

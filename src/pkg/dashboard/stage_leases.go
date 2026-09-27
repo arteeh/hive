@@ -487,6 +487,15 @@ func (s *Server) AdvanceStageLease(identity, taskID, to string, now time.Time, r
 		s.logger.Info("[runs] holding stage until checkpoint approval", "run", runKey, "stage", stage, "task", taskID)
 		return nil
 	}
+	if stage == StageSpec && to == StagePlan {
+		if decision := s.runCheckpointPolicy(StageSpec); !decision.blocks {
+			if store, epic := s.findRunEpic(runKey); epic != nil && epic.Meta(planning.MetaDesignVia) == planning.DesignViaSpektacular {
+				if err := s.autoApproveRunCheckpointWithGen(store, epic, runKey, StageSpec, gen, decision); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	advanced, err := h.advanceLeaseStage(identity, taskID, to, now)
 	if err != nil {
 		return err
@@ -494,7 +503,9 @@ func (s *Server) AdvanceStageLease(identity, taskID, to string, now time.Time, r
 	recordReceipt(advanced.identity)
 	if stage == StageSpec {
 		if decision := s.runCheckpointPolicy(StageSpec); !decision.blocks {
-			s.recordRunCheckpointAutoApproval(runKey, "", StageSpec, advanced.gen, now, decision)
+			if _, epic := s.findRunEpic(runKey); epic == nil || epic.Meta(planning.MetaDesignVia) != planning.DesignViaSpektacular {
+				s.recordRunCheckpointAutoApproval(runKey, "", StageSpec, gen, now, decision)
+			}
 		}
 	}
 	return nil
@@ -926,6 +937,16 @@ func (s *Server) autoApproveRunCheckpointWithGen(store *beads.Store, epic *beads
 	if store == nil || epic == nil {
 		return errors.New("run plan unavailable for checkpoint auto-approval")
 	}
+	if stage == StageSpec {
+		if planning.DesignStatus(epic) == planning.DesignStatusApproved {
+			return nil
+		}
+		if err := planning.ApproveDesign(store, epic.ID); err != nil {
+			return fmt.Errorf("auto-approving %s checkpoint for %s: %w", stage, runKey, err)
+		}
+		s.recordRunCheckpointAutoApproval(runKey, epic.ID, stage, gen, time.Now(), decision)
+		return nil
+	}
 	if epic.Meta(planning.MetaPlanStatus) == planning.PlanStatusApproved {
 		return nil
 	}
@@ -1025,17 +1046,16 @@ func (s *Server) runKeyForEpic(repo, number, runKey string) string {
 }
 
 // advanceApprovedPlanLease releases the lease AdvanceStageLease parked at the
-// plan checkpoint, once the plan has actually been approved. A run with no
-// live held plan lease is a no-op, not an error.
+// plan checkpoint, once the plan has actually been approved.
 func (s *Server) advanceApprovedPlanLease(runKey, epicID, actor string, now time.Time) error {
 	return s.advanceApprovedStageLease(runKey, epicID, StagePlan, StageImplement, actor, now)
 }
 
-func (s *Server) advanceApprovedSpecLease(runKey, epicID, actor string, now time.Time) error {
-	return s.advanceApprovedStageLease(runKey, epicID, StageSpec, StagePlan, actor, now)
+func (s *Server) advanceApprovedSpecLease(runKey, epicID, actor string, now time.Time, expectedGen ...uint64) error {
+	return s.advanceApprovedStageLease(runKey, epicID, StageSpec, StagePlan, actor, now, expectedGen...)
 }
 
-func (s *Server) advanceApprovedStageLease(runKey, epicID, fromStage, toStage, actor string, now time.Time) error {
+func (s *Server) advanceApprovedStageLease(runKey, epicID, fromStage, toStage, actor string, now time.Time, expectedGen ...uint64) error {
 	if s == nil || s.contributeHub == nil || runKey == "" {
 		return nil
 	}
@@ -1048,10 +1068,13 @@ func (s *Server) advanceApprovedStageLease(runKey, epicID, fromStage, toStage, a
 		}
 		identity, taskID, gen, found = id, task, g, true
 	})
-	if err != nil || !found {
+	if err != nil {
 		return err
 	}
-	_, err = s.contributeHub.advanceLeaseStageAt(identity, taskID, toStage, now, now.Add(time.Millisecond))
+	if !found {
+		return errRunCheckpointNotHeld
+	}
+	_, err = s.contributeHub.advanceLeaseStageAt(identity, taskID, toStage, now, now.Add(time.Millisecond), expectedGen...)
 	if err == nil {
 		s.recordRunCheckpointApproval(runKey, epicID, fromStage, actor, gen, now, nil)
 	}

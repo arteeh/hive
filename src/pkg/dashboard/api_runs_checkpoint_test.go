@@ -8,11 +8,13 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"github.com/hivecommons/hive/pkg/beads"
+	"github.com/hivecommons/hive/pkg/github"
 	"github.com/hivecommons/hive/pkg/planning"
 	"github.com/hivecommons/hive/pkg/timeline"
 )
@@ -164,6 +166,7 @@ func TestRunCheckpointDecisionApprovesCurrentGeneration(t *testing.T) {
 
 func TestRunCheckpointRejectResetsImplementLease(t *testing.T) {
 	s, store, epicID, runKey := checkpointTestServer(t, "", 6)
+	markCheckpointDesign(t, s, store, epicID, StagePlan, planning.DesignStatusRequested)
 	if err := store.Update(epicID, func(b *beads.Bead) {
 		b.Metadata[planning.MetaPlanStatus] = planning.PlanStatusApproved
 		b.Metadata[planning.MetaRunWaitingReason] = planning.WaitingReasonStalePlan
@@ -267,5 +270,162 @@ func TestRunCheckpointPayloadSummarizesSpecDocument(t *testing.T) {
 		if !strings.Contains(payload.Summary, want) {
 			t.Fatalf("spec summary missing %q: %s", want, payload.Summary)
 		}
+	}
+}
+
+func markCheckpointDesign(t *testing.T, s *Server, store *beads.Store, epicID, stage, status string) {
+	t.Helper()
+	if err := store.Update(epicID, func(b *beads.Bead) {
+		b.Metadata[planning.MetaDesignVia] = planning.DesignViaSpektacular
+		b.Metadata[planning.MetaDesignStatus] = status
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.contributeHub.leaseMu.Lock()
+	for _, l := range s.contributeHub.leases {
+		if l != nil && l.taskID == "task-8618" {
+			l.stage = stage
+		}
+	}
+	s.contributeHub.leaseMu.Unlock()
+}
+
+func TestRunCheckpointPlanDecisionWithUnapprovedDesign(t *testing.T) {
+	for _, action := range []string{"approve", "reject"} {
+		t.Run(action, func(t *testing.T) {
+			s, store, epicID, runKey := checkpointTestServer(t, "", 7)
+			markCheckpointDesign(t, s, store, epicID, StagePlan, planning.DesignStatusRequested)
+			rec := doOwnerPost(s, "/api/runs/"+url.PathEscape(runKey)+"/checkpoint", runCheckpointDecisionRequest{Action: action, Gen: 7})
+			if rec.Code != http.StatusOK {
+				t.Fatalf("decision = %d: %s", rec.Code, rec.Body.String())
+			}
+			epic, _ := store.Get(epicID)
+			lease, ok := s.contributeHub.runLeaseHolder(runKey, time.Now())
+			wantStage, wantStatus := StageImplement, planning.PlanStatusApproved
+			if action == "reject" {
+				wantStage, wantStatus = StagePlan, planning.PlanStatusDraft
+			}
+			if !ok || lease.stage != wantStage || (action == "approve" && lease.gen <= 7) || epic.Meta(planning.MetaPlanStatus) != wantStatus {
+				t.Fatalf("plan decision no-op: lease=%+v status=%s", lease, epic.Meta(planning.MetaPlanStatus))
+			}
+			if planning.DesignStatus(epic) != planning.DesignStatusRequested {
+				t.Fatal("plan decision modified design")
+			}
+		})
+	}
+}
+
+func TestRunCheckpointSpecApprovalSignalFailure(t *testing.T) {
+	s, store, epicID, runKey := checkpointTestServer(t, "", 7)
+	markCheckpointDesign(t, s, store, epicID, StageSpec, planning.DesignStatusRequested)
+	var calls atomic.Int32
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "GitHub unavailable", http.StatusInternalServerError)
+	}))
+	defer ghServer.Close()
+	s.deps.GHClient = github.NewClient("token", "myorg", []string{"repo1"}, s.logger, ghServer.URL)
+	rec := doOwnerPost(s, "/api/runs/"+url.PathEscape(runKey)+"/checkpoint", runCheckpointDecisionRequest{Action: "approve", Gen: 7})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("approve = %d: %s", rec.Code, rec.Body.String())
+	}
+	epic, _ := store.Get(epicID)
+	lease, ok := s.contributeHub.runLeaseHolder(runKey, time.Now())
+	if !ok || lease.stage != StagePlan || planning.DesignStatus(epic) != planning.DesignStatusApproved {
+		t.Fatalf("spec wedged: %+v", lease)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("GitHub signal not attempted")
+	}
+	found := false
+	for _, event := range s.LifecycleTimeline().ByIssue(runKey) {
+		found = found || event.Attrs["design_signal_error"] != ""
+	}
+	if !found {
+		t.Fatal("missing signal failure timeline event")
+	}
+	rec = doOwnerPost(s, "/api/runs/"+url.PathEscape(runKey)+"/checkpoint", runCheckpointDecisionRequest{Action: "approve", Gen: 7})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("replay = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRunCheckpointSpecApprovalAlreadyApproved(t *testing.T) {
+	s, store, epicID, runKey := checkpointTestServer(t, "", 7)
+	markCheckpointDesign(t, s, store, epicID, StageSpec, planning.DesignStatusApproved)
+	if err := store.SetMetadata(epicID, planning.MetaPlanStatus, ""); err != nil {
+		t.Fatal(err)
+	}
+	rec := doOwnerPost(s, "/api/runs/"+url.PathEscape(runKey)+"/checkpoint", runCheckpointDecisionRequest{Action: "approve", Gen: 7})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("retry = %d: %s", rec.Code, rec.Body.String())
+	}
+	lease, ok := s.contributeHub.runLeaseHolder(runKey, time.Now())
+	if !ok || lease.stage != StagePlan {
+		t.Fatalf("retry did not advance spec: %+v", lease)
+	}
+}
+
+func TestRunCheckpointDisabledSpecApprovesDesign(t *testing.T) {
+	s, store, epicID, runKey := checkpointTestServer(t, "", 7)
+	markCheckpointDesign(t, s, store, epicID, StageSpec, planning.DesignStatusRequested)
+	oldReceipts := runReceiptsDir
+	runReceiptsDir = t.TempDir()
+	t.Cleanup(func() { runReceiptsDir = oldReceipts })
+	off := false
+	s.deps.Config.Runs.Checkpoints.Spec = &off
+	if err := s.AdvanceStageLease("alice", "task-8618", StagePlan, time.Now(), []byte(`{}`), map[string]string{stageAttrRunKey: runKey}); err != nil {
+		t.Fatal(err)
+	}
+	epic, _ := store.Get(epicID)
+	if planning.DesignStatus(epic) != planning.DesignStatusApproved || epic.Meta(planning.MetaPlanStatus) != planning.PlanStatusDraft {
+		t.Fatalf("auto approval: design=%s plan=%s", planning.DesignStatus(epic), epic.Meta(planning.MetaPlanStatus))
+	}
+	attrs := s.runCheckpointApprovalAttrs(runKey, StageSpec, 7)
+	if attrs[runCheckpointActorKey] != runCheckpointAutoActor || attrs[runCheckpointEpicKey] != epicID {
+		t.Fatalf("missing provenance: %+v", attrs)
+	}
+}
+
+func TestAdvanceApprovedCheckpointRequiresMatchingLease(t *testing.T) {
+	s, _, epicID, runKey := checkpointTestServer(t, "", 7)
+	if err := s.advanceApprovedSpecLease(runKey, epicID, "owner", time.Now()); err == nil {
+		t.Fatal("approval succeeded without spec lease")
+	}
+}
+
+func TestRunCheckpointSpecLeaseFailurePreservesDesign(t *testing.T) {
+	s, store, epicID, runKey := checkpointTestServer(t, "", 7)
+	markCheckpointDesign(t, s, store, epicID, StageSpec, planning.DesignStatusRequested)
+	// A directory cannot be replaced by the lease registry's atomic rename.
+	s.contributeHub.persistTaskLedgers = true
+	s.contributeHub.taskLeasesFile = t.TempDir()
+	rec := doOwnerPost(s, "/api/runs/"+url.PathEscape(runKey)+"/checkpoint", runCheckpointDecisionRequest{Action: "approve", Gen: 7})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("approve = %d: %s", rec.Code, rec.Body.String())
+	}
+	epic, _ := store.Get(epicID)
+	if planning.DesignStatus(epic) != planning.DesignStatusRequested {
+		t.Fatal("failed lease advance published design approval")
+	}
+	s.contributeHub.persistTaskLedgers = false
+	rec = doOwnerPost(s, "/api/runs/"+url.PathEscape(runKey)+"/checkpoint", runCheckpointDecisionRequest{Action: "approve", Gen: 7})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("retry = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRunCheckpointSpecApprovalFencesRetriedGeneration(t *testing.T) {
+	s, store, epicID, runKey := checkpointTestServer(t, "", 7)
+	markCheckpointDesign(t, s, store, epicID, StageSpec, planning.DesignStatusRequested)
+	if err := s.RetryStageLease("alice", "task-8618", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.advanceApprovedSpecLease(runKey, epicID, "owner", time.Now(), 7); err == nil {
+		t.Fatal("stale approval advanced a retried spec lease")
+	}
+	lease, ok := s.contributeHub.runLeaseHolder(runKey, time.Now())
+	if !ok || lease.stage != StageSpec || lease.gen != 8 {
+		t.Fatalf("stale approval changed lease: %+v", lease)
 	}
 }

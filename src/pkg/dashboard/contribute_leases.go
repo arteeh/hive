@@ -285,8 +285,8 @@ func (h *ContributeWSHub) advanceLeaseStage(identity, taskID, to string, now tim
 	return h.advanceLeaseStageAt(identity, taskID, to, now, time.Time{})
 }
 
-func (h *ContributeWSHub) advanceLeaseStageAt(identity, taskID, to string, now, transitionAt time.Time) (taskLease, error) {
-	return h.mutateLeaseStage(identity, taskID, to, leaseStageAdvance, "", now, transitionAt)
+func (h *ContributeWSHub) advanceLeaseStageAt(identity, taskID, to string, now, transitionAt time.Time, expectedGen ...uint64) (taskLease, error) {
+	return h.mutateLeaseStage(identity, taskID, to, leaseStageAdvance, "", now, transitionAt, expectedGen...)
 }
 
 func (h *ContributeWSHub) retryLeaseStage(identity, taskID string, now time.Time) (taskLease, error) {
@@ -320,7 +320,7 @@ func (h *ContributeWSHub) resetLeaseStage(identity, taskID, to, reason string, n
 	return h.mutateLeaseStage(identity, taskID, to, leaseStageReset, reason, now, time.Time{})
 }
 
-func (h *ContributeWSHub) mutateLeaseStage(identity, taskID, to string, mode leaseStageMutation, reason string, now, transitionAt time.Time) (taskLease, error) {
+func (h *ContributeWSHub) mutateLeaseStage(identity, taskID, to string, mode leaseStageMutation, reason string, now, transitionAt time.Time, expectedGen ...uint64) (taskLease, error) {
 	if identity == "" || taskID == "" {
 		return taskLease{}, fmt.Errorf("identity and taskID are required")
 	}
@@ -332,6 +332,12 @@ func (h *ContributeWSHub) mutateLeaseStage(identity, taskID, to string, mode lea
 	if l == nil {
 		h.leaseMu.Unlock()
 		return taskLease{}, fmt.Errorf("%w for %s", errLeaseNotFound, taskID)
+	}
+	// Check the checkpoint generation in the same critical section as the
+	// transition: a retry may have replaced the lease since the API read it.
+	if len(expectedGen) > 0 && l.gen != expectedGen[0] {
+		h.leaseMu.Unlock()
+		return taskLease{}, errors.New("stale checkpoint generation")
 	}
 	// An ADVANCE or RESET needs a live lease: a stage can only complete, or be
 	// stepped back by an owner, while someone holds it. A RETRY is the reclaim

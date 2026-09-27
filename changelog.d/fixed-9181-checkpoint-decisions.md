@@ -1,0 +1,1 @@
+- Run checkpoint decisions now follow the current stage, disabled spec checkpoints approve the design automatically, and GitHub approval-signal failures no longer strand runs at spec ([#9181](https://github.com/hivecommons/hive/issues/9181)).

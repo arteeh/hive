@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -488,8 +489,9 @@ func (s *Server) handlePlanApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Release the lease the plan checkpoint parked, now that the plan is
-	// approved (hivecommons/hive#8550).
-	if err := s.advanceApprovedPlanLease(runKey, epicID, requestUser(r), time.Now()); err != nil {
+	// approved (hivecommons/hive#8550). Standalone plans have no run lease;
+	// only the run checkpoint API requires one to accept an approval.
+	if err := s.advanceApprovedPlanLease(runKey, epicID, requestUser(r), time.Now()); err != nil && !errors.Is(err, errRunCheckpointNotHeld) {
 		jsonError(w, err.Error(), http.StatusConflict)
 		return
 	}
