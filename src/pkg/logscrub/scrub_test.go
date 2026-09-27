@@ -116,6 +116,25 @@ func TestBearerRegressionMarkedMode(t *testing.T) {
 	}
 }
 
+func TestScrubStringLeavesOrdinaryHyphenatedWords(t *testing.T) {
+	cases := []string{
+		"risk-free planning",
+		"desk-top notes",
+		"task-list item",
+		"sk-learn example",
+	}
+	for _, in := range cases {
+		t.Run(in, func(t *testing.T) {
+			if got := ScrubString(in, WithMarkers()); got != in {
+				t.Fatalf("ScrubString marked altered prose: got %q", got)
+			}
+			if got := ScrubString(in); got != in {
+				t.Fatalf("ScrubString default altered prose: got %q", got)
+			}
+		})
+	}
+}
+
 func TestRelayAndGoSecretPatternCategoriesAgree(t *testing.T) {
 	const relayPath = "../../../bin/contributor-relay.js"
 	body, err := os.ReadFile(relayPath)

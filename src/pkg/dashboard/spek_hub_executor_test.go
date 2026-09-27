@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -431,6 +435,128 @@ func TestSpekHubExecutorEnvUsesAllowlistedValuesAndRunToken(t *testing.T) {
 		if _, ok := byKey[key]; ok {
 			t.Fatalf("%s reached child env", key)
 		}
+	}
+}
+
+func TestSpekHubExecutorOutputIsScrubbedForStatusLogAndDetail(t *testing.T) {
+	_, s, _, _ := spekHub(t)
+	key := "myorg/repo1#57"
+	st := spekHubStage{runKey: key, stage: StageSpec, taskID: "task", repo: spekRepo, number: 57, gen: 2}
+	if err := s.contributeHub.recordLeaseForKeyStage(config.DefaultSpektacularHubExecutorIdentity, st.taskID, spekRepo, 57, spekRepo+"!"+key+":"+StageSpec, "trusted", StageSpec, st.gen, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	e := NewSpekHubExecutor(s, config.RunsConfig{MaxStageRetries: 1, Spektacular: config.SpektacularConfig{Enabled: true}}, "copilot", "", nil, nil)
+	worktree := spekHubRunWorktreePath(e.Identity, key)
+	if err := os.MkdirAll(filepath.Join(worktree, ".hive"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ghp := "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd"
+	pat := "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	apiKey := "sk-live-ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	bearer := "Bearer abcdefghijklmnop1234567890"
+	raw := "auth failed " + ghp + " " + pat + " " + apiKey + " Authorization: " + bearer + "\n"
+	e.Exec = func(context.Context, string, []string, string, ...string) ([]byte, error) {
+		return []byte(raw), errors.New("exit status 1")
+	}
+	out, _, err := e.runStageCommand(context.Background(), worktree, nil, st, []string{"agent"})
+	if err == nil {
+		t.Fatal("runStageCommand: expected an error")
+	}
+	e.recordFailure(st, e.executionKey(st), fmt.Errorf("agent CLI failed: %w: %s", err, string(out)))
+	status := e.Status()
+	if status.LastError == "" {
+		t.Fatal("last error was not recorded")
+	}
+	captureStatus := spekHubArtifactStatus{Name: "myorg-repo1-57", ArtifactID: "myorg-repo1-57", DocumentStatus: "final", CurrentStep: "finished"}
+	if err := e.captureCompletedStage(st, worktree, "myorg-repo1-57", captureStatus, out, time.Now(), nil, runReceiptsDir, "session"); err != nil {
+		t.Fatalf("captureCompletedStage: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/runs/"+url.PathEscape(key)+"/log?stage=spec&gen=2", nil)
+	req.Header.Set("X-Hive-Role", config.RoleRead)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("log response = %d body=%s", rec.Code, rec.Body.String())
+	}
+	detail, err := s.buildRunDetail(httptest.NewRequest(http.MethodGet, "/api/runs/"+url.PathEscape(key)+"/detail", nil), key)
+	if err != nil {
+		t.Fatalf("buildRunDetail: %v", err)
+	}
+	detailJSON, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for label, text := range map[string]string{
+		"last_error": status.LastError,
+		"run_log":    rec.Body.String(),
+		"detail":     string(detailJSON),
+	} {
+		for _, rawValue := range []string{ghp, pat, apiKey, bearer} {
+			if strings.Contains(text, rawValue) {
+				t.Fatalf("%s retained %q in %q", label, rawValue, text)
+			}
+		}
+	}
+}
+
+func TestSpekHubScrubWriterStreamsCompleteLinesAndFlushesPartial(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stage.log")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	writer := newSpekHubScrubWriter(file)
+
+	token := "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd"
+	first := "live " + token[:18]
+	if _, err := writer.Write([]byte(first)); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if data, err := os.ReadFile(path); err != nil || len(data) != 0 {
+		t.Fatalf("partial line was written before newline: data=%q err=%v", string(data), err)
+	}
+	if _, err := writer.Write([]byte(token[18:] + "\n")); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), token) || !strings.Contains(string(data), "live <redacted:github-token>\n") {
+		t.Fatalf("complete split-token line was not scrubbed live: %q", string(data))
+	}
+
+	partial := "tail sk-live-ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	if _, err := writer.Write([]byte(partial)); err != nil {
+		t.Fatalf("partial write: %v", err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "tail ") {
+		t.Fatalf("trailing partial line was written before close: %q", string(data))
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), partial) || !strings.Contains(string(data), "tail <redacted:api-key>") {
+		t.Fatalf("trailing partial line was not scrubbed on close: %q", string(data))
 	}
 }
 
