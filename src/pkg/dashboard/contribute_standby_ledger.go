@@ -1,7 +1,9 @@
 package dashboard
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -9,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	github "github.com/google/go-github/v72/github"
 	ghpkg "github.com/hivecommons/hive/pkg/github"
 	standbypkg "github.com/hivecommons/hive/pkg/standby"
 )
@@ -132,7 +135,26 @@ func (h *ContributeWSHub) recordVerifiedStandbyPR(contributor, lane, repo, prURL
 	})
 }
 
-func (h *ContributeWSHub) reconcileOpenStandbyOutcomes() {
+// Reconciliation is owned by one background worker. Suspension reads never do
+// network I/O, including reads under h.mu or on the WebSocket read loop. Wait
+// between completed passes so slow GitHub responses cannot queue more work.
+const standbyReconcileInterval = 5 * time.Minute
+
+func (h *ContributeWSHub) standbyReconcileLoop(ctx context.Context) {
+	defer close(h.standbyReconcileDone)
+	for {
+		timer := time.NewTimer(standbyReconcileInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			h.reconcileOpenStandbyOutcomes(ctx)
+		}
+	}
+}
+
+func (h *ContributeWSHub) reconcileOpenStandbyOutcomes(ctx context.Context) {
 	if h == nil || h.server == nil || h.server.deps == nil || h.server.deps.GHClient == nil {
 		return
 	}
@@ -142,24 +164,43 @@ func (h *ContributeWSHub) reconcileOpenStandbyOutcomes() {
 
 	settled := map[string]bool{}
 	for _, rec := range rows {
-		if rec.Kind == standbypkg.OutcomeMerged || rec.Kind == standbypkg.OutcomeClosedUnmerged || rec.Kind == standbypkg.OutcomeMergedAfterRework {
+		if rec.Kind == standbypkg.OutcomeUnknown || rec.Kind == standbypkg.OutcomeMerged || rec.Kind == standbypkg.OutcomeClosedUnmerged || rec.Kind == standbypkg.OutcomeMergedAfterRework {
 			settled[standbyOutcomePRKey(rec)] = true
 		}
 	}
 
 	var add []standbyOutcomeRecord
+	checked := map[string]bool{}
 	for _, rec := range rows {
 		if rec.Kind != standbypkg.OutcomeOpen || rec.Repo == "" || rec.Number <= 0 || settled[standbyOutcomePRKey(rec)] {
 			continue
 		}
+		prKey := standbyOutcomePRKey(rec)
+		if checked[prKey] {
+			continue
+		}
+		checked[prKey] = true
+		if ctx.Err() != nil {
+			break
+		}
 		contributor, _, _ := strings.Cut(rec.Key, "|")
 		prURL := "https://github.com/" + rec.Repo + "/pull/" + strconv.Itoa(rec.Number)
-		detail := h.verifyReportedPRDetail(rec.Repo, prURL, contributor)
-		if !detail.Verified {
-			continue
+		// Use verification directly: a background lookup is not a reported
+		// completion and must not emit the misleading "no-PR" completion log.
+		lookupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		detail := h.server.deps.GHClient.VerifyReportedPR(lookupCtx, rec.Repo, prURL, contributor)
+		cancel()
+		var apiErr *github.ErrorResponse
+		missing := errors.As(detail.Err, &apiErr) && apiErr.Response != nil && apiErr.Response.StatusCode == http.StatusNotFound
+		if !detail.Verified && !missing {
+			continue // transient and permission errors remain retryable
 		}
 		var kind standbypkg.OutcomeKind
 		switch {
+		case missing:
+			// Legacy dispatch rows name issues. A 404 is not evidence against
+			// a donor; retire it as unknown rather than retrying forever.
+			kind = standbypkg.OutcomeUnknown
 		case detail.Merged:
 			kind = standbypkg.OutcomeMerged
 		case strings.EqualFold(detail.State, "closed"):
@@ -192,7 +233,6 @@ func standbyOutcomePRKey(rec standbyOutcomeRecord) string {
 }
 
 func (h *ContributeWSHub) standbySuspended(key string) (bool, int) {
-	h.reconcileOpenStandbyOutcomes()
 	h.completedMu.Lock()
 	defer h.completedMu.Unlock()
 	rows := standbypkg.OutcomesFor(h.standbyOutcomes, key)
