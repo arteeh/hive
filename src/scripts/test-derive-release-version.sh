@@ -194,6 +194,14 @@ if [[ "$(get "$out" release)" == "true" && "$(get "$out" version)" == "5.0.0" ]]
 else
   note_fail "expected 5.0.0 via RELEASE_LINE on detached HEAD, got: $out"
 fi
+# v6 GA must not inherit either predecessor's major, even on detached HEAD.
+git -C "$repo" tag -f v5.99.0 >/dev/null 2>&1
+out=$( cd "$repo" && GITHUB_OUTPUT="" RELEASE_LINE=v6 bash "$derive" CHANGELOG.md 2>&1 )
+if [[ "$(get "$out" release)" == "true" && "$(get "$out" version)" == "6.0.0" ]]; then
+  note_ok "detached v6 with inherited v4/v5 tags starts at 6.0.0"
+else
+  note_fail "expected first v6 release 6.0.0, got: $out"
+fi
 git -C "$repo" checkout -q master 2>/dev/null || git -C "$repo" checkout -q main 2>/dev/null || true
 
 if [[ $fail -ne 0 ]]; then

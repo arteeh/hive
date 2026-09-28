@@ -1,0 +1,1 @@
+- Wire the v6 release line to its own semver tags, GA image channels, and stable-promotion lineage, with CI coverage and a coordinated cutover checklist ([#9154](https://github.com/hivecommons/hive/issues/9154)).

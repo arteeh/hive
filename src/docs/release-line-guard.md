@@ -66,6 +66,41 @@ and turns cutting `v5` into one edit that CI enforces.
 3. Add it to every list under `env_lists` — today that is `docker.yml`'s
    `LONG_LIVED`, without which the new line builds but never publishes.
 
+4. Re-pin the new branch's `tagged-release.yml` end to end: build-event
+   selection, backstop tip, `RELEASE_LINE`, concurrency, release PR base,
+   Docker dispatch ref, ancestry check, and GitHub Release target. Keep the
+   protected-PR/check gates intact. Verify the first tag derives as `vN.0.0`.
+5. Set `promote-stable.yml`'s checkout, `RELEASE_BRANCH`, and concurrency to
+   the new line. Retain the soak, smoke, blocker, and digest checks.
+6. Coordinate channel ownership **before merging the channel switch**. In
+   the old line's own PR, remove its `candidate`/`latest` publishing and
+   disable its stable promotion writes; it keeps branch/SHA and semver tags.
+   Drain old publishing/promotion runs before activating the new writers.
+   Do not backport the new line's release workflow into the old branch.
+   On v6, all three Docker image rows and their cross-org mirrors publish
+   `candidate,latest,edge`. Keep the unconditional `INCLUDE_LATEST` flag
+   false so non-v6 builds cannot move `latest`. Keep `edge` on v6 until a
+   successor development line is deliberately assigned.
+7. Have a maintainer verify branch protection, required checks, release-token
+   access, and repository settings, then make the new line the default
+   branch. GitHub loads scheduled and `workflow_run` workflows from the
+   default branch; changing only the new branch's YAML does not move those
+   automatic paths. Before the switch, manual runs must name `--ref v6`
+   (substitute the new line). Never bypass a write gate to complete the cut.
+8. Run `src/scripts/check-release-lines.sh`,
+   `src/scripts/test-release-lines-guard.sh`,
+   `src/scripts/test-v6-release-path.py`,
+   `src/scripts/test-release-push-retry.sh`,
+   `src/scripts/test-derive-release-version.sh`, and
+   `src/scripts/test-publish-image-tags.sh`. Inspect the first release's
+   ancestry and all three native/mirror image digests; evaluate stable
+   promotion in dry-run mode before allowing a write. Update the release
+   and channel docs together with the workflow rows.
+
+For #9154, steps 6 and 7 are maintainer rollout prerequisites, not actions
+performed by a contributor's v6 PR. The old branch's policy and repository
+settings are outside that PR's diff.
+
 Doing only step 1 fails the guard, naming each workflow that would not run on
 the new branch and each list that would not publish it. That is the
 demonstration

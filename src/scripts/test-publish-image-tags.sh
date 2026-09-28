@@ -61,7 +61,7 @@ run_case() {
   local mode=$1 run=$2 capture=$3
   PATH="$tmp/bin:$PATH" MOCK_INSPECT_MODE=$mode MOCK_CAPTURE="$capture" \
     PUBLISH_INSPECT_RETRY_DELAY=0 \
-    "$publisher" ghcr.io/hivecommons/hive "$tmp/digests" v6 abcdef123456 "$run" v6 false edge
+    "$publisher" ghcr.io/hivecommons/hive "$tmp/digests" v6 abcdef123456 "$run" v6 false candidate,latest,edge
 }
 
 run_custom_case() {
@@ -76,10 +76,25 @@ run_case missing 100 "$capture"
 grep -q 'hive:abcdef1' "$capture"
 grep -q 'hive:v6-latest' "$capture"
 grep -q 'hive:edge' "$capture"
-if grep -q 'hive:stable\|hive:candidate' "$capture"; then
-  echo "v6 publish moved v5-owned stable/candidate tags" >&2
+grep -q 'hive:candidate' "$capture"
+grep -q 'hive:latest' "$capture"
+if grep -q 'hive:stable' "$capture"; then
+  echo "v6 publish moved soak-gated stable tag" >&2
   exit 1
 fi
+
+# The v6 workflow also builds other long-lived branches. They must not move
+# any channel, including latest (whose positional flag is unconditional).
+for branch in v5 topic/test; do
+  capture="$tmp/non-release-${branch//\//-}"
+  PATH="$tmp/bin:$PATH" MOCK_INSPECT_MODE=missing MOCK_CAPTURE="$capture" \
+    PUBLISH_INSPECT_RETRY_DELAY=0 \
+    "$publisher" ghcr.io/hivecommons/hive "$tmp/digests" "$branch" abcdef123456 100 v6 false candidate,latest,edge
+  if grep -Eq 'hive:(candidate|latest|edge|stable)( |$)' "$capture"; then
+    echo "non-v6 branch $branch moved a channel" >&2
+    exit 1
+  fi
+done
 
 capture="$tmp/create-forward"
 run_case 99 100 "$capture"
@@ -151,7 +166,7 @@ workflow="$script_dir/../../.github/workflows/docker.yml"
 # #7721 Phase 1: v6 owns edge only. :latest/candidate/stable belong to the
 # v5 line. Every image row on this lane (mirror steps too) must pass
 # INCLUDE_LATEST=false and publish no other channel.
-[[ $(grep -c 'v6 false edge' "$workflow") -eq 3 ]]
+[[ $(grep -c 'v6 false candidate,latest,edge' "$workflow") -eq 3 ]]
 if grep -q 'v6 true \|v5 false edge\|CHANNELS: "stable\|CHANNELS: "candidate' "$workflow"; then
   echo "docker workflow publishes a v5-owned tag (or still names v5) from the v6 lane" >&2
   exit 1

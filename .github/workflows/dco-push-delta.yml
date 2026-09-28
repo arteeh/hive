@@ -33,6 +33,7 @@ on:
       - v4
       - v5
 
+      - v6
 permissions:
   contents: read
 

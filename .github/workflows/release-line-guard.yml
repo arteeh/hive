@@ -33,6 +33,7 @@ on:
       - '.github/release-lines.yml'
       - 'src/scripts/check-release-lines.sh'
       - 'src/scripts/test-release-lines-guard.sh'
+      - 'src/scripts/test-v6-release-path.py'
   pull_request:
     branches:
       - '**'
@@ -41,6 +42,7 @@ on:
       - '.github/release-lines.yml'
       - 'src/scripts/check-release-lines.sh'
       - 'src/scripts/test-release-lines-guard.sh'
+      - 'src/scripts/test-v6-release-path.py'
   workflow_dispatch:
 
 
@@ -65,3 +67,9 @@ jobs:
 
       - name: Check workflow branch filters against .github/release-lines.yml
         run: src/scripts/check-release-lines.sh
+
+      - name: Install release workflow test dependency
+        run: python3 -m pip install PyYAML==6.0.2
+
+      - name: Verify v6 release and channel routing
+        run: src/scripts/test-v6-release-path.py

@@ -135,10 +135,11 @@ jobs:
           # v5 added (RFC #4000/#4001/#4002 implementation line, branched from v4
           # HEAD): without it here the '**' trigger above still BUILDS v5 as a CI
           # gate, but never PUSHES, so v5-latest would never exist on GHCR. This
-          # Channel ownership (#7721 Phase 1): v5 publishes candidate + :latest
-          # (stable moves only via promote-stable.yml after soak), v6 publishes
-          # edge, v4 is maintenance and publishes no channel — see the
-          # RELEASE_BRANCH/CHANNELS args on each publish step below.
+          # v6 GA channel ownership (#9154): v6 publishes candidate/latest/edge.
+          # Keep INCLUDE_LATEST false: the positional flag is not branch-gated;
+          # latest belongs in CHANNELS so other branches cannot move it.
+          # stable moves only via promote-stable.yml after soak. Coordinate
+          # retiring v5's channel writers per src/docs/release-line-guard.md.
           LONG_LIVED: "v4 v5 mk dd v6"
           EVENT: ${{ github.event_name }}
           TARGET_SHA: ${{ inputs.release_sha || github.sha }}
@@ -515,7 +516,7 @@ jobs:
           src/scripts/publish-image-tags.sh \
             ghcr.io/${{ github.repository_owner }}/hive /tmp/digests \
             "$REF_NAME" "$GATE_SHA" "$RUN_NUMBER" \
-            v6 false edge
+            v6 false candidate,latest,edge
 
       # ---- Cross-org mirror (kubestellar <-> hivecommons dual-publish) ----
       # Copy the tags just published above into the other org's GHCR
@@ -579,7 +580,7 @@ jobs:
           # publish step above — keep them in lockstep with that call.
           INCLUDE_LATEST: "false"
           RELEASE_BRANCH: "v6"
-          CHANNELS: "edge"
+          CHANNELS: "candidate,latest,edge"
         run: |
           set -euo pipefail
           # Same tag set publish-image-tags.sh manages for this image. Each
@@ -728,7 +729,7 @@ jobs:
           src/scripts/publish-image-tags.sh \
             ghcr.io/${{ github.repository_owner }}/hive-contributor /tmp/contrib-digests \
             "$REF_NAME" "$GATE_SHA" "$RUN_NUMBER" \
-            v6 false edge
+            v6 false candidate,latest,edge
 
       # Cross-org mirror — same mechanics, same missing-secret asymmetry, and
       # same "one credential per registry host" ordering constraint as the
@@ -771,7 +772,7 @@ jobs:
           # Lockstep with the publish-image-tags.sh args above.
           INCLUDE_LATEST: "false"
           RELEASE_BRANCH: "v6"
-          CHANNELS: "edge"
+          CHANNELS: "candidate,latest,edge"
         run: |
           set -euo pipefail
           branch_tag="${BRANCH//\//-}"
@@ -928,7 +929,7 @@ jobs:
           src/scripts/publish-image-tags.sh \
             ghcr.io/${{ github.repository_owner }}/hive-hub /tmp/hub-digests \
             "$REF_NAME" "$GATE_SHA" "$RUN_NUMBER" \
-            v6 false edge
+            v6 false candidate,latest,edge
 
       # Cross-org mirror — same mechanics, same missing-secret asymmetry, and
       # same "one credential per registry host" ordering constraint as the
@@ -971,7 +972,7 @@ jobs:
           # Lockstep with the publish-image-tags.sh args above.
           INCLUDE_LATEST: "false"
           RELEASE_BRANCH: "v6"
-          CHANNELS: "edge"
+          CHANNELS: "candidate,latest,edge"
         run: |
           set -euo pipefail
           branch_tag="${BRANCH//\//-}"
