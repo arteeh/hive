@@ -155,6 +155,8 @@ func TestSendAPIError(t *testing.T) {
 	}{
 		{name: "http error", status: http.StatusInternalServerError, body: "boom"},
 		{name: "slack not ok", status: http.StatusOK, body: `{"ok":false,"error":"channel_not_found"}`},
+		{name: "missing scope", status: http.StatusOK, body: `{"ok":false,"error":"missing_scope"}`},
+		{name: "wrong token type", status: http.StatusOK, body: `{"ok":false,"error":"not_allowed_token_type"}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -165,6 +167,8 @@ func TestSendAPIError(t *testing.T) {
 			defer ts.Close()
 			if err := newTestBot(ts.URL).Send("hello"); err == nil {
 				t.Fatal("expected error")
+			} else if (tt.name == "missing scope" || tt.name == "wrong token type") && strings.Contains(err.Error(), chat.ErrTopicUnsupported.Error()) {
+				t.Fatalf("Send error = %v, must identify the Slack API error", err)
 			}
 		})
 	}
@@ -182,6 +186,37 @@ func TestSetTopicMissingScopeDegradesToUnsupported(t *testing.T) {
 	err := newTestBot(ts.URL).SetTopic("topic")
 	if !errors.Is(err, chat.ErrTopicUnsupported) {
 		t.Fatalf("SetTopic error = %v, want ErrTopicUnsupported", err)
+	}
+}
+
+func TestSetTopicNotAllowedTokenTypeDegradesToUnsupported(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "not_allowed_token_type"})
+	}))
+	defer ts.Close()
+
+	err := newTestBot(ts.URL).SetTopic("topic")
+	if !errors.Is(err, chat.ErrTopicUnsupported) {
+		t.Fatalf("SetTopic error = %v, want ErrTopicUnsupported", err)
+	}
+}
+
+func TestSendSlackScopeErrorsRemainAPIErrors(t *testing.T) {
+	for _, apiError := range []string{"missing_scope", "not_allowed_token_type"} {
+		t.Run(apiError, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": apiError})
+			}))
+			defer ts.Close()
+
+			err := newTestBot(ts.URL).Send("hello")
+			if errors.Is(err, chat.ErrTopicUnsupported) {
+				t.Fatalf("Send error = %v, want Slack API error", err)
+			}
+			if !strings.Contains(err.Error(), apiError) {
+				t.Fatalf("Send error = %v, want %q", err, apiError)
+			}
+		})
 	}
 }
 
@@ -309,11 +344,14 @@ func TestListenFiltersChannelAndMarksBots(t *testing.T) {
 
 func TestMarkdownToMrkdwn(t *testing.T) {
 	tests := map[string]string{
-		"**bold**":                        "*bold*",
-		"keep `**code**` literal":         "keep `**code**` literal",
-		"mix **bold** and `code` here":    "mix *bold* and `code` here",
-		"see [docs](https://example.com)": "see <https://example.com|docs>",
-		"keep `[x](y)` literal":           "keep `[x](y)` literal",
+		"**bold**":                                  "*bold*",
+		"keep `**code**` literal":                   "keep `**code**` literal",
+		"mix **bold** and `code` here":              "mix *bold* and `code` here",
+		"see [docs](https://example.com)":           "see <https://example.com|docs>",
+		"keep `[x](y)` literal":                     "keep `[x](y)` literal",
+		"escape & <@U123> <!channel> >":             "escape &amp; &lt;@U123&gt; &lt;!channel&gt; &gt;",
+		"see [<docs>](https://example.com?a=1&b=2)": "see <https://example.com?a=1&b=2|&lt;docs&gt;>",
+		"keep `<!channel> &` literal":               "keep `<!channel> &` literal",
 	}
 	for in, want := range tests {
 		if got := markdownToMrkdwn(in); got != want {

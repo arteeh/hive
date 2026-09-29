@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -178,7 +179,14 @@ func (b *slackBackend) Send(content string) error {
 }
 
 func (b *slackBackend) SetTopic(topic string) error {
-	err := b.postJSON("/conversations.setTopic", map[string]string{"channel": b.channelID, "topic": topic})
+	data, err := json.Marshal(map[string]string{"channel": b.channelID, "topic": topic})
+	if err != nil {
+		return err
+	}
+	parsed, err := b.callSlack(context.Background(), "/conversations.setTopic", bytes.NewReader(data), b.botToken)
+	if parsed.Error == "missing_scope" || parsed.Error == "not_allowed_token_type" {
+		err = chat.ErrTopicUnsupported
+	}
 	if errors.Is(err, chat.ErrTopicUnsupported) {
 		b.logger.Debug("slack topic update unsupported", "error", err)
 	}
@@ -518,13 +526,17 @@ func (b *slackBackend) callSlack(ctx context.Context, path string, body io.Reade
 		}
 	}
 	if !parsed.OK {
-		if parsed.Error == "missing_scope" || parsed.Error == "not_allowed_token_type" {
-			return parsed, chat.ErrTopicUnsupported
-		}
 		if parsed.Error == "" {
 			parsed.Error = "not_ok"
 		}
-		return parsed, fmt.Errorf("slack API error: %s", parsed.Error)
+		message := fmt.Sprintf("slack API error: %s", parsed.Error)
+		switch parsed.Error {
+		case "missing_scope":
+			message += " (check the token has the required Slack scope)"
+		case "not_allowed_token_type":
+			message += " (check app_token is xapp-… and bot_token is xoxb-…)"
+		}
+		return parsed, errors.New(message)
 	}
 	return parsed, nil
 }
@@ -554,12 +566,16 @@ func markdownToMrkdwn(s string) string {
 		}
 		if !inCode && s[i] == '[' {
 			if text, url, width, ok := parseMarkdownLink(s[i:]); ok {
-				out.WriteString("<" + url + "|" + text + ">")
+				out.WriteString("<" + url + "|" + escapeMrkdwn(text) + ">")
 				i += width
 				continue
 			}
 		}
-		out.WriteByte(s[i])
+		if !inCode {
+			out.WriteString(escapeMrkdwn(string(s[i])))
+		} else {
+			out.WriteByte(s[i])
+		}
 		i++
 	}
 	return out.String()
@@ -575,7 +591,18 @@ func parseMarkdownLink(s string) (text, url string, width int, ok bool) {
 		return "", "", 0, false
 	}
 	closeURL += closeText + 2
-	return s[1:closeText], s[closeText+2 : closeURL], closeURL + 1, true
+	linkURL := s[closeText+2 : closeURL]
+	parsed, err := neturl.Parse(linkURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || strings.ContainsAny(linkURL, "<>|\r\n\t ") {
+		return "", "", 0, false
+	}
+	return s[1:closeText], linkURL, closeURL + 1, true
+}
+
+// escapeMrkdwn quotes Slack control characters in untrusted text. Link URLs
+// are handled separately because they are delimiters inside a mrkdwn link.
+func escapeMrkdwn(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
 }
 
 func splitSlackMessage(s string) []string {
