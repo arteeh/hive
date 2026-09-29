@@ -103,7 +103,7 @@ func TestConsumeSSEIdleWatchdogUnblocksRead(t *testing.T) {
 	if !connected {
 		t.Fatal("consumeSSE did not report connected")
 	}
-	if err == nil || !strings.Contains(err.Error(), "idle timeout") {
+	if !errors.Is(err, errSSEIdle) {
 		t.Fatalf("consumeSSE error = %v, want idle timeout", err)
 	}
 	if elapsed := time.Since(startedAt); elapsed > time.Second {
@@ -115,7 +115,7 @@ func TestConsumeSSEBoundsIncompleteFrame(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(make([]byte, sseMaxBufferBytes+1))
+		_, _ = w.Write(make([]byte, sseMaxPendingBytes+1))
 	}))
 	defer ts.Close()
 
@@ -125,7 +125,7 @@ func TestConsumeSSEBoundsIncompleteFrame(t *testing.T) {
 	if !connected {
 		t.Fatal("consumeSSE did not report connected")
 	}
-	if err == nil || !strings.Contains(err.Error(), "frame buffer exceeded") {
+	if err == nil || !strings.Contains(err.Error(), "without terminator") {
 		t.Fatalf("consumeSSE error = %v, want bounded buffer error", err)
 	}
 }

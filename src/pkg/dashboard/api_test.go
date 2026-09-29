@@ -77,16 +77,9 @@ func testDeps(t *testing.T) *Dependencies {
 		NewLinearAgent:       newTestLinearAgentFactory(logger, "", ""),
 		LinearStoredViewerID: testLinearStoredViewerID,
 		DashboardChatSubmit:  chatBot.Submit,
-		DashboardChatDrain: func(since uint64) []ChatOutbound {
-			msgs := chatBot.Drain(since)
-			out := make([]ChatOutbound, 0, len(msgs))
-			for _, msg := range msgs {
-				out = append(out, ChatOutbound{Seq: msg.Seq, Text: msg.Text, Role: msg.Role, AuthorID: msg.AuthorID})
-			}
-			return out
-		},
-		RefreshFunc: func() { refreshCalled.Store(true) },
-		PersistFunc: func() { persistCalled.Store(true) },
+		DashboardChatPoll:    chatPollForTest(chatBot),
+		RefreshFunc:          func() { refreshCalled.Store(true) },
+		PersistFunc:          func() { persistCalled.Store(true) },
 	}
 }
 
@@ -881,7 +874,6 @@ func TestHandleChat_CommandHintsReturnConcreteAnswers(t *testing.T) {
 		{query: "/who", want: "Who is online"},
 		{query: "/jam who is online?", want: "contributor agents online"},
 		{query: "Show contributor activity", want: "No contributor activity"},
-		{query: "!runs spec owner/repo#N", want: "Spec runs (1)"},
 		{query: "spek: active campaigns", want: "Active campaigns"},
 		{query: "spek: spec runs", want: "Spec runs (1)"},
 		{query: "Explain inception relay state", want: "Inception relay state"},

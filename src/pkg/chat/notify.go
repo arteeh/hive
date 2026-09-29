@@ -3,24 +3,40 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	agentpkg "github.com/hivecommons/hive/pkg/agent"
 )
 
 const (
-	topicDebounceMS          = 5000
-	sseReconnectBase         = 5 * time.Second
-	sseReconnectMax          = 60 * time.Second
-	sseIdleTimeout           = 2 * time.Minute
+	topicDebounceMS  = 5000
+	sseReconnectBase = 5 * time.Second
+	sseReconnectMax  = 60 * time.Second
+	// sseIdleTimeout is 2× the default dashboard eval interval (300 s). The
+	// dashboard also emits agent-status frames every ~10 s, so a healthy stream
+	// never goes this long without bytes; a silently dropped connection does.
+	sseIdleTimeout = 10 * time.Minute
+	// sseMaxPendingBytes bounds the buffered, not-yet-terminated SSE frame.
+	sseMaxPendingBytes = 8 << 20
+	// sseResponseHeaderTimeout bounds the wait for the dashboard to answer the
+	// stream request at all, well before the idle watchdog would fire.
 	sseResponseHeaderTimeout = 30 * time.Second
-	sseMaxBufferBytes        = 1 << 20
+
+	sseEventAgentStatus = "agent-status"
 )
+
+var errSSEIdle = errors.New("SSE stream idle")
+
+// agentStatusFrame is the payload of a dashboard `event: agent-status` frame.
+type agentStatusFrame struct {
+	Agents []agentSnapshot `json:"agents"`
+}
 
 type statusSnapshot struct {
 	Agents    []agentSnapshot   `json:"agents"`
@@ -72,7 +88,7 @@ func (s *Service) sseLoop(ctx context.Context) {
 
 		connected, err := s.consumeSSE(ctx)
 		if err != nil {
-			s.logger.Warn("discord SSE disconnected", "error", err)
+			s.logger.Warn("chat: dashboard SSE disconnected", "error", err)
 		}
 		if connected {
 			delay = s.sseReconnectBase
@@ -84,7 +100,7 @@ func (s *Service) sseLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(delay):
+		case <-time.After(delay + time.Duration(rand.Int64N(int64(delay)/2+1))):
 		}
 		if !connected {
 			delay = min(delay*2, maxDelay)
@@ -93,23 +109,28 @@ func (s *Service) sseLoop(ctx context.Context) {
 }
 
 func (s *Service) consumeSSE(ctx context.Context) (bool, error) {
+	idle := s.sseIdleTimeout
+	if idle == 0 {
+		idle = sseIdleTimeout
+	}
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	watchdog := time.AfterFunc(idle, func() { cancel(fmt.Errorf("%w for %s", errSSEIdle, idle)) })
+	defer watchdog.Stop()
+
 	url := s.dashboardURL + "/api/events"
-	streamCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false, err
 	}
-	if s.dashboardToken != "" {
-		req.Header.Set("Authorization", "Bearer "+s.dashboardToken)
-	}
+	s.authorizeDashboardRequest(ctx, req)
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = sseResponseHeaderTimeout
 	sseClient := &http.Client{Transport: transport}
 	resp, err := sseClient.Do(req)
 	if err != nil {
-		return false, err
+		return false, sseErr(ctx, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -117,47 +138,13 @@ func (s *Service) consumeSSE(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("SSE status %d", resp.StatusCode)
 	}
 
-	idleTimeout := s.sseIdleTimeout
-	if idleTimeout == 0 {
-		idleTimeout = sseIdleTimeout
-	}
-	activity := make(chan struct{}, 1)
-	var idleExpired atomic.Bool
-	watchdogDone := make(chan struct{})
-	go func() {
-		defer close(watchdogDone)
-		timer := time.NewTimer(idleTimeout)
-		defer timer.Stop()
-		for {
-			select {
-			case <-timer.C:
-				idleExpired.Store(true)
-				cancel()
-				return
-			case <-activity:
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				timer.Reset(idleTimeout)
-			case <-streamCtx.Done():
-				return
-			}
-		}
-	}()
-	defer func() {
-		cancel()
-		<-watchdogDone
-	}()
-
 	buf := make([]byte, 4096)
 	var buffer string
 
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
+			watchdog.Reset(idle)
 			buffer += string(buf[:n])
 			for {
 				idx := strings.Index(buffer, "\n\n")
@@ -166,32 +153,72 @@ func (s *Service) consumeSSE(ctx context.Context) (bool, error) {
 				}
 				block := buffer[:idx]
 				buffer = buffer[idx+2:]
-
-				for _, line := range strings.Split(block, "\n") {
-					if strings.HasPrefix(line, "data:") {
-						payload := strings.TrimSpace(line[5:])
-						var snap statusSnapshot
-						if json.Unmarshal([]byte(payload), &snap) == nil {
-							s.onSSEEvent(&snap)
-						}
-					}
-				}
-				select {
-				case activity <- struct{}{}:
-				default:
-				}
+				s.handleSSEBlock(block)
 			}
-			if len(buffer) > sseMaxBufferBytes {
-				return true, fmt.Errorf("SSE frame buffer exceeded %d bytes", sseMaxBufferBytes)
+			if len(buffer) > sseMaxPendingBytes {
+				return true, fmt.Errorf("SSE frame exceeds %d bytes without terminator", sseMaxPendingBytes)
 			}
 		}
 		if err != nil {
-			if idleExpired.Load() {
-				return true, fmt.Errorf("SSE idle timeout after %s", idleTimeout)
-			}
-			return true, err
+			return true, sseErr(ctx, err)
 		}
 	}
+}
+
+// sseErr reports the watchdog cause instead of a bare context error when the
+// idle timer tore the stream down.
+func sseErr(ctx context.Context, err error) error {
+	if cause := context.Cause(ctx); errors.Is(cause, errSSEIdle) {
+		return cause
+	}
+	return err
+}
+
+// handleSSEBlock dispatches one SSE frame by its `event:` name. Unnamed frames
+// carry the full status snapshot; agent-status frames carry only agents and
+// must not reset governor/inception/runs state or the topic.
+func (s *Service) handleSSEBlock(block string) {
+	event := ""
+	var data []string
+	for _, line := range strings.Split(block, "\n") {
+		switch {
+		case strings.HasPrefix(line, "event:"):
+			event = strings.TrimSpace(line[len("event:"):])
+		case strings.HasPrefix(line, "data:"):
+			data = append(data, strings.TrimSpace(line[len("data:"):]))
+		}
+	}
+	if len(data) == 0 {
+		return
+	}
+	payload := []byte(strings.Join(data, "\n"))
+	switch event {
+	case "", "message":
+		var snap statusSnapshot
+		if json.Unmarshal(payload, &snap) == nil {
+			s.onSSEEvent(&snap)
+		}
+	case sseEventAgentStatus:
+		var frame agentStatusFrame
+		if json.Unmarshal(payload, &frame) == nil {
+			s.onAgentStatusEvent(frame.Agents)
+		}
+	}
+}
+
+func (s *Service) onAgentStatusEvent(agents []agentSnapshot) {
+	s.mu.Lock()
+	prev := s.lastState
+	if prev == nil {
+		s.mu.Unlock()
+		return
+	}
+	next := *prev
+	next.Agents = agents
+	s.lastState = &next
+	s.mu.Unlock()
+
+	s.diffAgents(prev, &next)
 }
 
 func (s *Service) onSSEEvent(snap *statusSnapshot) {
@@ -201,31 +228,31 @@ func (s *Service) onSSEEvent(snap *statusSnapshot) {
 	s.mu.Unlock()
 
 	if prev == nil {
-		if len(snap.Runs) > 0 {
-			s.mu.Lock()
-			s.lastRuns = runSliceMap(snap.Runs)
-			s.mu.Unlock()
-		} else {
-			s.syncRunsFromSSE(context.Background())
-		}
+		s.refreshRunsFromSnapshot(snap)
 		return
 	}
 
 	s.diffAgents(prev, snap)
 	s.diffGovernor(prev, snap)
 	s.diffInception(prev, snap)
-	if len(snap.Runs) > 0 {
-		s.mu.Lock()
-		prevRuns := s.lastRuns
-		s.lastRuns = runSliceMap(snap.Runs)
-		s.mu.Unlock()
-		if prevRuns != nil {
-			s.diffRuns(runMapSlice(prevRuns), snap.Runs)
-		}
-	} else {
-		s.syncRunsFromSSE(context.Background())
-	}
+	s.refreshRunsFromSnapshot(snap)
 	s.updateTopic(snap)
+}
+
+// refreshRunsFromSnapshot diffs snap.Runs against the last known run state,
+// including on the very first snapshot: a run already at waiting_on=human
+// when the bot (re)connects must still be announced, not just recorded as a
+// baseline for future transitions.
+func (s *Service) refreshRunsFromSnapshot(snap *statusSnapshot) {
+	if len(snap.Runs) == 0 {
+		s.syncRunsFromSSE(context.Background())
+		return
+	}
+	s.mu.Lock()
+	prevRuns := s.lastRuns
+	s.lastRuns = runSliceMap(snap.Runs)
+	s.mu.Unlock()
+	s.diffRuns(runMapSlice(prevRuns), snap.Runs)
 }
 
 func (s *Service) diffAgents(prev, cur *statusSnapshot) {
@@ -403,17 +430,39 @@ func (s *Service) updateTopic(snap *statusSnapshot) {
 	topic := fmt.Sprintf("%s · %s · %di %dpr", strings.Join(parts, " "), snap.Governor.Mode, snap.Governor.Issues, snap.Governor.PRs)
 
 	s.mu.Lock()
-	changed := topic != s.lastTopic
+	defer s.mu.Unlock()
+	if topic == s.lastTopic {
+		return
+	}
 	s.lastTopic = topic
-	s.mu.Unlock()
+	s.pendingTopic = topic
+	if s.topicTimer != nil {
+		return
+	}
+	debounce := s.topicDebounce
+	if debounce == 0 {
+		debounce = time.Duration(topicDebounceMS) * time.Millisecond
+	}
+	s.topicTimer = time.AfterFunc(debounce, s.flushTopic)
+}
 
-	if changed {
-		go func() {
-			time.Sleep(time.Duration(topicDebounceMS) * time.Millisecond)
-			if err := s.backend.SetTopic(topic); err != nil {
-				s.logger.Debug("topic update failed", "error", err)
-			}
-		}()
+// flushTopic applies the latest topic queued during the debounce window.
+func (s *Service) flushTopic() {
+	s.mu.Lock()
+	topic := s.pendingTopic
+	s.topicTimer = nil
+	s.mu.Unlock()
+	if err := s.backend.SetTopic(topic); err != nil {
+		s.logger.Debug("topic update failed", "error", err)
+	}
+}
+
+func (s *Service) stopTopicTimer() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.topicTimer != nil {
+		s.topicTimer.Stop()
+		s.topicTimer = nil
 	}
 }
 
