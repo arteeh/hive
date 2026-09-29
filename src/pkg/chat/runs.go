@@ -51,8 +51,10 @@ func (l *runSnapshotList) UnmarshalJSON(data []byte) error {
 		*l = runs
 		return nil
 	}
-	// /api/status currently exposes runs as a summary object. Keep SSE parsing
-	// compatible while allowing event payloads that carry the full run array.
+	// /api/status publishes runs as a []RunSummary array
+	// (dashboard.StatusPayload.Runs), which the branch above handles. Any other
+	// shape — older dashboards published a summary object here — decodes as
+	// "no runs" so one unexpected field never fails the whole status payload.
 	*l = nil
 	return nil
 }
@@ -277,7 +279,8 @@ func (s *Service) cmdRunsApprove(ctx context.Context, key string) (string, error
 	if err := s.postRunCheckpointDecision(ctx, checkpoint, "approve"); err != nil {
 		return fmt.Sprintf("❌ Failed to approve run `%s`: %s", key, err), nil
 	}
-	s.observeRunDecision(ctx, key)
+	author, _ := ctx.Value(commandAuthorContextKey{}).(string)
+	s.observeRunDecision(ctx, author, key)
 	s.clearPendingCheckpoint(key)
 	return fmt.Sprintf("✅ Approved run `%s` checkpoint gen %d.", key, checkpoint.Gen), nil
 }
@@ -296,7 +299,8 @@ func (s *Service) cmdRunsReject(ctx context.Context, key, reason string) (string
 	if err := s.postRunCheckpointDecision(ctx, checkpoint, "reject"); err != nil {
 		return fmt.Sprintf("❌ Failed to reject run `%s`: %s", key, err), nil
 	}
-	s.observeRunDecision(ctx, key)
+	author, _ := ctx.Value(commandAuthorContextKey{}).(string)
+	s.observeRunDecision(ctx, author, key)
 	s.clearPendingCheckpoint(key)
 	return fmt.Sprintf("✅ Rejected run `%s` checkpoint gen %d: %s", key, checkpoint.Gen, reason), nil
 }
@@ -368,7 +372,7 @@ func (s *Service) handlePendingCheckpointReply(ctx context.Context, msg Message,
 	if verb != "approve" && verb != "reject" {
 		return false
 	}
-	if len(s.allowedUsers) == 0 {
+	if s.allowedUserCount() == 0 {
 		return false
 	}
 	role, ok := s.allowedUserRole(msg.AuthorID)
@@ -377,6 +381,14 @@ func (s *Service) handlePendingCheckpointReply(ctx context.Context, msg Message,
 	}
 	matches := s.pendingCheckpointsForAuthor(msg.AuthorID)
 	if len(matches) == 0 {
+		// A run reaching the human gate while the bot was down (or before this
+		// author was ever prompted) leaves no pendingCheckpoints entry. Without
+		// this, a bare "approve"/"reject" from an owner falls through to the
+		// persona/interview handlers with no reply at all (issue #9124).
+		if config.RoleAtLeast(role, config.RoleOwner) {
+			s.enqueue("❌ No pending run checkpoint for you right now. Use `!runs list` to see active runs, then `!runs approve <key>` or `!runs reject <key> <reason>`.")
+			return true
+		}
 		return false
 	}
 	if !config.RoleAtLeast(role, config.RoleOwner) {
@@ -417,7 +429,7 @@ func (s *Service) handlePendingCheckpointReply(ctx context.Context, msg Message,
 			s.enqueue(fmt.Sprintf("❌ Failed to reject run `%s`: %s", runKey, err))
 			return true
 		}
-		s.observeRunDecision(ctx, runKey)
+		s.observeRunDecision(ctx, msg.AuthorID, runKey)
 		s.clearPendingCheckpoint(runKey)
 		s.enqueue(fmt.Sprintf("✅ Rejected run `%s` checkpoint gen %d: %s", runKey, checkpoint.Gen, reason))
 	default:
@@ -425,7 +437,7 @@ func (s *Service) handlePendingCheckpointReply(ctx context.Context, msg Message,
 			s.enqueue(fmt.Sprintf("❌ Failed to approve run `%s`: %s", runKey, err))
 			return true
 		}
-		s.observeRunDecision(ctx, runKey)
+		s.observeRunDecision(ctx, msg.AuthorID, runKey)
 		s.clearPendingCheckpoint(runKey)
 		s.enqueue(fmt.Sprintf("✅ Approved run `%s` checkpoint gen %d.", runKey, checkpoint.Gen))
 	}
@@ -459,6 +471,12 @@ func (s *Service) pendingCheckpointsForAuthor(author string) []*pendingCheckpoin
 	return out
 }
 
+// diffRuns posts checkpoint prompts for runs that reach the human gate and
+// clears pending state for runs that leave it. Leaving the gate — decided
+// elsewhere, or the run finishing — also drops every author's persona marks
+// for the run; a run that finishes without ever waiting on a human drops its
+// marks too. Marks on a run still in flight are kept: an expansion before the
+// gate is what makes the eventual decision informed.
 func (s *Service) diffRuns(prev, cur []runSnapshot) {
 	prevMap := make(map[string]runSnapshot, len(prev))
 	curMap := make(map[string]runSnapshot, len(cur))
@@ -473,12 +491,19 @@ func (s *Service) diffRuns(prev, cur []runSnapshot) {
 		}
 		if run.WaitingOn != "human" {
 			s.clearPendingCheckpoint(run.Key)
+			if existed && old.WaitingOn == "human" {
+				s.forgetRunMarks(run.Key)
+			}
 		}
 	}
 	for key, old := range prevMap {
-		if _, ok := curMap[key]; !ok && old.WaitingOn == "human" {
+		if _, ok := curMap[key]; ok {
+			continue
+		}
+		if old.WaitingOn == "human" {
 			s.clearPendingCheckpoint(key)
 		}
+		s.forgetRunMarks(key)
 	}
 }
 
@@ -524,7 +549,7 @@ func (s *Service) formatRunCheckpointForAuthor(ctx context.Context, author strin
 		}
 	}
 	prefix := ""
-	if author != "" && len(s.allowedUsers) > 1 {
+	if author != "" && s.allowedUserCount() > 1 {
 		prefix = "For " + author + ": "
 	}
 	return fmt.Sprintf("%sRun %s stage %s gen %d needs a decision: %s. Reply approve or reject <reason>. Full artifact: %s",
@@ -543,9 +568,9 @@ func checkpointTechnicalSummary(payload runCheckpointPayload) string {
 
 func (s *Service) ownerAuthors() map[string]struct{} {
 	authors := map[string]struct{}{}
-	for _, user := range s.allowedUsers {
-		if config.RoleAtLeast(user.role, config.RoleOwner) {
-			authors[user.id] = struct{}{}
+	for author, role := range s.allowedUsersSnapshot() {
+		if config.RoleAtLeast(role, config.RoleOwner) {
+			authors[author] = struct{}{}
 		}
 	}
 	return authors
@@ -576,9 +601,9 @@ func (s *Service) syncRunsFromSSE(ctx context.Context) {
 	curMap := runSliceMap(runs)
 	s.lastRuns = curMap
 	s.mu.Unlock()
-	if prevMap == nil {
-		return
-	}
+	// Diff even when prevMap is nil (first fetch): runMapSlice(nil) yields an
+	// empty slice, so diffRuns treats every waiting_on=human run here as a
+	// transition and announces it instead of silently adopting it as baseline.
 	s.diffRuns(runMapSlice(prevMap), runs)
 }
 

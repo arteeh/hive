@@ -87,6 +87,8 @@ var ErrTopicUnsupported = errors.New("chat topic updates unsupported")
 
 // Message is a transport-agnostic inbound chat message.
 type Message struct {
+	// ID must be stable across redeliveries and unique within this service.
+	// Empty IDs are delivered without deduplication.
 	ID       string
 	Text     string
 	AuthorID string
@@ -104,6 +106,16 @@ type Backend interface {
 	Listen(ctx context.Context, deliver func(Message))
 }
 
+// CommandRefuser is an optional Backend extension. The spine refuses commands
+// from authors outside the allowlist without replying on the channel, so a
+// public transport never becomes an oracle for who is allowlisted. A transport
+// whose author is already authenticated and is the only reader of the reply
+// (dashboard chat) implements this to show the refusal instead of leaving the
+// operator waiting; the decision itself stays in the spine.
+type CommandRefuser interface {
+	CommandRefused(msg Message, reason string)
+}
+
 type Config struct {
 	DashboardURL      string
 	DashboardToken    string
@@ -111,7 +123,10 @@ type Config struct {
 	MessageLimit      int
 	SendInterval      time.Duration
 	HeartbeatInterval time.Duration
-	PersonaStore      PersonaStore
+	// PersonaStore holds each author's persona. cmd/hive passes a view of the
+	// shared durable FilePersonaStore; nil falls back to an in-memory map that
+	// is lost on restart (hivecommons/hive#9175).
+	PersonaStore PersonaStore
 	// PersonaLearning returns the live persona learning configuration
 	// (hivecommons/hive#8363). Nil or a disabled result means no signals are
 	// counted and no suggestions are made. It is a func so a Features panel
@@ -123,10 +138,12 @@ type Config struct {
 }
 
 type Service struct {
+	inbound           recentMessages
 	backend           Backend
 	dashboardURL      string
 	dashboardToken    string
 	allowedUsers      map[string]allowedUser
+	allowedUsersMu    sync.RWMutex
 	commands          map[string]CommandHandler
 	agentNames        []string
 	mu                sync.RWMutex
@@ -137,6 +154,8 @@ type Service struct {
 	heartbeatInterval time.Duration
 	sseReconnectBase  time.Duration
 	sseReconnectMax   time.Duration
+	sseIdleTimeout    time.Duration
+	topicDebounce     time.Duration
 	personaStore      PersonaStore
 	personaLearning   func() persona.LearningConfig
 	audit             agentaudit.AuditSink
@@ -146,6 +165,8 @@ type Service struct {
 	lastState          *statusSnapshot
 	lastRuns           map[string]runSnapshot
 	lastTopic          string
+	pendingTopic       string
+	topicTimer         *time.Timer
 	pendingInterviews  map[pendingInterviewKey]*pendingInterview
 	pendingPersonas    map[pendingPersonaKey]*pendingPersonaSetup
 	pendingCheckpoints map[pendingCheckpointKey]*pendingCheckpoint
@@ -160,6 +181,12 @@ type msgItem struct {
 }
 
 func NewService(backend Backend, cfg Config, logger *slog.Logger) *Service {
+	// Every spine log line carries the transport it runs on; the spine itself
+	// is transport-agnostic, so message text never names one
+	// (hivecommons/hive#9129).
+	if backend != nil && logger != nil {
+		logger = logger.With("backend", backend.Name())
+	}
 	allowed := parseAllowedUsers(cfg.AllowedUsers)
 	messageLimit := cfg.MessageLimit
 	if messageLimit == 0 {
@@ -192,6 +219,8 @@ func NewService(backend Backend, cfg Config, logger *slog.Logger) *Service {
 		heartbeatInterval:  heartbeatInterval,
 		sseReconnectBase:   sseReconnectBase,
 		sseReconnectMax:    sseReconnectMax,
+		sseIdleTimeout:     sseIdleTimeout,
+		topicDebounce:      time.Duration(topicDebounceMS) * time.Millisecond,
 		personaStore:       personaStore,
 		personaLearning:    cfg.PersonaLearning,
 		audit:              cfg.AuditSink,
@@ -232,9 +261,39 @@ func parseAllowedUsers(entries []string) map[string]allowedUser {
 	return allowed
 }
 
+// SetAllowedUsers replaces the live allowlist used by all inbound chat gates.
+// The heartbeat is authoritative for dashboard access on a spoke, so this must
+// update the running service rather than only the boot configuration snapshot.
+func (s *Service) SetAllowedUsers(entries []string) {
+	allowed := parseAllowedUsers(entries)
+	s.allowedUsersMu.Lock()
+	s.allowedUsers = allowed
+	s.allowedUsersMu.Unlock()
+}
+
 func (s *Service) allowedUserRole(author string) (string, bool) {
+	s.allowedUsersMu.RLock()
 	user, ok := s.allowedUsers[config.IdentityMatchKey(author)]
+	s.allowedUsersMu.RUnlock()
 	return user.role, ok
+}
+
+func (s *Service) allowedUserCount() int {
+	s.allowedUsersMu.RLock()
+	count := len(s.allowedUsers)
+	s.allowedUsersMu.RUnlock()
+	return count
+}
+
+// allowedUsersSnapshot maps each configured identity to its role.
+func (s *Service) allowedUsersSnapshot() map[string]string {
+	s.allowedUsersMu.RLock()
+	users := make(map[string]string, len(s.allowedUsers))
+	for _, user := range s.allowedUsers {
+		users[user.id] = user.role
+	}
+	s.allowedUsersMu.RUnlock()
+	return users
 }
 
 func parseAllowedUser(entry string, index int) (string, string) {
@@ -277,7 +336,7 @@ func (s *Service) Start(ctx context.Context) error {
 		return fmt.Errorf("chat backend not configured")
 	}
 
-	s.logger.Info("chat service starting", "backend", s.backend.Name())
+	s.logger.Info("chat service starting")
 
 	s.registerBuiltinCommands()
 
@@ -285,8 +344,9 @@ func (s *Service) Start(ctx context.Context) error {
 	go s.backend.Listen(ctx, func(msg Message) { s.Deliver(ctx, msg) })
 	go s.sseLoop(ctx)
 	go s.heartbeatLoop(ctx)
+	context.AfterFunc(ctx, s.stopTopicTimer)
 
-	s.enqueue("⚙️ **[pipeline]** Hive v2 Discord bot online")
+	s.enqueue(fmt.Sprintf("⚙️ **[pipeline]** Hive chat bot online (%s)", s.backend.Name()))
 	return nil
 }
 
@@ -295,7 +355,7 @@ func (s *Service) enqueue(content string) {
 	select {
 	case s.msgQueue <- msgItem{content: content}:
 	default:
-		s.logger.Warn("discord message queue full, dropping message")
+		s.logger.Warn("chat: message queue full, dropping message")
 	}
 }
 
@@ -303,16 +363,20 @@ func (s *Service) DrainLoop(ctx context.Context) {
 	s.drainLoop(ctx)
 }
 
+// drainLoop delivers queued messages one chunk at a time, paced by
+// sendInterval. Splitting and retry follow the contract documented in
+// send.go; a chunk is only skipped once its retries are exhausted.
 func (s *Service) drainLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case item := <-s.msgQueue:
-			if err := s.backend.Send(item.content); err != nil {
-				s.logger.Warn("discord send failed", "error", err)
+			for _, chunk := range SplitMessage(item.content, s.messageLimit) {
+				if !s.sendChunk(ctx, chunk) || !sleepContext(ctx, s.sendInterval) {
+					return
+				}
 			}
-			time.Sleep(s.sendInterval)
 		}
 	}
 }
