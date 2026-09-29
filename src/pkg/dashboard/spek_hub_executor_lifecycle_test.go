@@ -99,7 +99,7 @@ func TestSpekHubExecutorRevocationPreservesWorkUntilJoined(t *testing.T) {
 			clear(hub.leases)
 			hub.leaseMu.Unlock()
 			e.mu.Lock()
-			e.failures["obsolete"] = 1
+			e.held["obsolete"] = true
 			e.mu.Unlock()
 			if err := e.sweepStaleWorktrees(context.Background()); err != nil {
 				t.Fatal(err)
@@ -107,7 +107,7 @@ func TestSpekHubExecutorRevocationPreservesWorkUntilJoined(t *testing.T) {
 			if _, err := os.Stat(work); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("stale worktree retained: %v", err)
 			}
-			if len(e.failures) != 0 || len(e.activity) != 0 {
+			if len(e.held) != 0 || len(e.activity) != 0 {
 				t.Fatal("obsolete bookkeeping retained")
 			}
 			e.Tick(context.Background(), time.Now())
