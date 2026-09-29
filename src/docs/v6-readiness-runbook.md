@@ -15,7 +15,7 @@ Common setup for chat surfaces:
   spine. Chat commands call dashboard endpoints such as `/api/status` and
   `/api/kick/<agent>` (`src/pkg/chat/dashboard.go:15-19`,
   `src/pkg/chat/dashboard.go:127-143`), and notification delivery comes from the
-  `/api/events` SSE stream (`src/pkg/chat/notify.go:85-124`).
+  `/api/events` SSE stream (`consumeSSE`, `src/pkg/chat/notify.go:108-161`).
 - Pick an allowlisted human ID for the target surface. The shared command router
   fails closed when `allowed_users` is empty and logs ignored commands from
   non-allowlisted users (`Service.routeMessage` in `src/pkg/chat/router.go`).
@@ -26,7 +26,8 @@ Common setup for chat surfaces:
   the bot has started, such as pausing and resuming a non-critical agent from
   the dashboard. Valid notifications are the rendered `Working`, `Completed`,
   `Paused`, `Resumed`, `Off (cadence rule)`, or governor-mode-change messages
-  emitted from SSE snapshots (`src/pkg/chat/notify.go:150-212`).
+  emitted from SSE snapshots (`diffAgents`, `src/pkg/chat/notify.go:253-297`;
+  `diffGovernor`, `src/pkg/chat/notify.go:398-403`).
 - The command round-trip can be `!status` because it reads `/api/status` and
   returns a status message (`src/pkg/chat/dashboard.go:15-58`); `!kick <agent>
   readiness smoke` is also acceptable when the agent can safely be kicked.
@@ -69,12 +70,12 @@ Prerequisites:
   `github.mentions.default_agent` or an unambiguous mention-capable agent, and
   either a trusted dashboard role floor or explicit summoners. The config fields
   and defaults include `summoners`, `min_role`, and the default `eyes` ack
-  reaction (`src/pkg/config/config.go:1865-1885`). If webhook acceleration is
+  reaction (`src/pkg/config/github_integration_config.go:10-23`). If webhook acceleration is
   used, set `github.mentions.webhook_secret_env`; polling alone is acceptable
-  (`src/pkg/config/config.go:1874-1876`, `src/pkg/mention/webhook.go:32-41`).
+  (`src/pkg/config/github_integration_config.go:21`, `src/pkg/mention/webhook.go:32-41`).
 - The selected agent must be enabled, hold `Converse`, have a mention channel,
   and be governor-kickable; the handler declines otherwise
-  (`src/pkg/mention/types.go:177-223`).
+  (`resolveAgent`, `src/pkg/mention/types.go:435`).
 
 Run:
 
@@ -85,8 +86,9 @@ Run:
    the handling window.
 3. Confirm the kick was recorded with `source=mention:<node id>` and the audit
    event is `agent_mention_kicked`; declined attempts use
-   `agent_mention_declined` (`src/pkg/mention/types.go:14-16`,
-   `src/pkg/mention/types.go:100-124`).
+   `agent_mention_declined` (`AuditKicked`/`AuditDeclined`,
+   `src/pkg/mention/types.go:15-16`; guards in `Handle`,
+   `src/pkg/mention/types.go:103`).
 4. If the run completes, link the App-bot completion reply or the run log. The
    responder promotes pending mention kicks when it sees `kick-delivered` /
    `kick-log-archived` and can post a thread reply (`src/pkg/mention/responder.go:34-61`,
@@ -194,12 +196,12 @@ Prerequisites:
 - Configure the `slack` notification block with `enabled: true`,
   `app_token: ${SLACK_APP_TOKEN}`, `bot_token: ${SLACK_BOT_TOKEN}`,
   `channel_id`, and `allowed_users` containing the maintainer's Slack user ID
-  (`src/docs/design/slack-integration.md:104-117`). The backend refuses to
+  (`src/docs/design/slack-integration.md:113-128`). The backend refuses to
   start without app token, bot token, and channel ID
   (`Bot.Start` in `src/pkg/slack/bot.go`).
 - Slack app scopes/events must cover Socket Mode and messages as documented:
   `chat:write`, channel history/manage as needed, `connections:write`, and
-  `message.channels` (`src/docs/design/slack-integration.md:116-119`).
+  `message.channels` (`src/docs/design/slack-integration.md:130-135`).
 
 Run:
 
@@ -212,8 +214,8 @@ Run:
    safe working→idle transition after the first SSE snapshot. Save the Slack
    notification link or screenshot.
 4. Save any relevant Socket Mode lines. Valid reconnect evidence includes
-   `slack socket disconnected`, `slack socket ack failed`, or Slack
-   `disconnect` / `refresh_requested` handling (`slackBackend.Listen` and `slackBackend.consumeSocket` in
+   `slack socket refreshed`, `slack socket disconnected`, `slack socket ack failed`, or Slack
+   `disconnect` / `refresh_requested` handling (`slackBackend.Listen` and `slackBackend.serveSocket` in
    `src/pkg/slack/bot.go`).
 
 Evidence checklist:
@@ -233,13 +235,23 @@ Prerequisites:
   shipped v6 work (`src/docs/roadmap.md:55`).
 - Configure the Discord bot token, channel ID, and the maintainer's Discord user
   ID in `allowed_users`; the Discord config structure uses `bot_token`,
-  `channel_id`, and `allowed_users` (`src/pkg/config/config.go:4144-4154`).
-  The backend refuses to start without the bot token (`Start`, `src/pkg/discord/bot.go:105-112`).
+  `channel_id`, and `allowed_users` (`src/pkg/config/notifications_config.go:91-105`).
+  The backend refuses to start without the bot token (`Bot.Start`, `src/pkg/discord/bot.go:139`).
+- In the Discord Developer Portal, enable the **Message Content Intent**
+  (Bot → Privileged Gateway Intents) for the application backing the bot
+  token. Discord's Message Object contract applies to REST reads the same as
+  gateway events: without this intent the poller's `GET
+  /channels/{id}/messages` calls return messages with empty `content`, so the
+  bot looks healthy (polling, "bot online") but silently ignores every
+  command (hivecommons/hive#9141). There is no error to grep for this case —
+  see the notes below on distinguishing it from a permissions problem.
+- Grant the bot channel permissions View Channel, Read Message History, and
+  Send Messages (plus Manage Channels if topic updates are used).
 
 Run:
 
 1. Confirm the hive log has `discord bot starting` and `chat service starting`
-   (`Start` in `src/pkg/discord/bot.go`, `Service.Start` in `src/pkg/chat/chat.go`).
+   (`Bot.Start` in `src/pkg/discord/bot.go`, `Service.Start` in `src/pkg/chat/chat.go`).
 2. In the configured channel, send `!status`; save the Discord message link or
    screenshot and the bot reply.
 3. Trigger one notification delivery by pausing/resuming an agent or waiting for
@@ -247,9 +259,9 @@ Run:
 4. Induce one safe disconnect and recovery observation. Prefer briefly
    interrupting the dashboard SSE connection, because the shared spine logs
    `discord SSE disconnected` and backs off before reconnecting
-   (`src/pkg/chat/notify.go:46-81`). If you instead interrupt Discord REST,
+   (`sseLoop`, `src/pkg/chat/notify.go:70-106`). If you instead interrupt Discord REST,
    save the `discord poll failed` log line and the later successful command or
-   notification proving recovery (`Listen`, `src/pkg/discord/bot.go:192-224`).
+   notification proving recovery (`discordBackend.Listen`, `src/pkg/discord/bot.go:194-236`).
 
 Evidence checklist:
 
@@ -272,7 +284,7 @@ Prerequisites:
   `client_secret`, `team_id`, `channel_id`, `webhook_url`, and an
   `allowed_users` entry for the maintainer's Azure AD object ID. The config
   field names and fail-closed allowed-user contract are in `MSTeamsConfig`
-  (`src/pkg/config/config.go:4127-4141`), and validation/startup require all
+  (`src/pkg/config/notifications_config.go:67-89`), and validation/startup require all
   Teams connection fields (`src/pkg/config/validate.go:107-125`,
   `src/pkg/msteams/bot.go:180-198`).
 - `webhook_url` must be a Teams **Workflows** webhook URL: in the target
@@ -316,7 +328,7 @@ Prerequisites:
 - Configure `notifications.matrix.enabled`, `homeserver_url`, `access_token`,
   `room_id`, and an `allowed_users` entry containing the maintainer's MXID. The
   config field names and allowed-user contract are in `MatrixConfig`
-  (`src/pkg/config/config.go:4113-4124`), and startup requires homeserver URL,
+  (`src/pkg/config/notifications_config.go:51-65`), and startup requires homeserver URL,
   access token, and room ID (`src/pkg/matrix/bot.go:164-174`).
 
 Run:
@@ -348,7 +360,7 @@ Prerequisites:
 - Configure `notifications.telegram.enabled`, `bot_token`, `chat_id`, and
   `allowed_users` with the maintainer's Telegram numeric user ID. The config
   field names and fail-closed allowed-user contract are in `TelegramConfig`
-  (`src/pkg/config/config.go:4100-4110`), and startup requires bot token and
+  (`src/pkg/config/notifications_config.go:36-49`), and startup requires bot token and
   chat ID (`src/pkg/telegram/bot.go:124-129`).
 
 Run:
@@ -503,7 +515,7 @@ Prerequisites:
   digest recipients are optional. The design shows the operator-facing block
   (`src/docs/design/escalation-surfaces.md:73-103`), while the config schema
   and validation require host/from/to when enabled
-  (`src/pkg/config/config.go:6709-6727`, `src/pkg/config/validate.go:182-201`).
+  (`src/pkg/config/escalation_config.go:20-33`, `src/pkg/config/validate.go:182-201`).
 
 Run:
 
@@ -543,7 +555,7 @@ Prerequisites:
   and at least one provider: `ntfy.url` plus optional `token`, Pushover
   `app_token` and `user_key`, or PagerDuty `routing_key`. The config schema and
   validation enforce provider presence and the severity values
-  (`src/pkg/config/config.go:6729-6749`, `src/pkg/config/validate.go:202-225`).
+  (`src/pkg/config/escalation_config.go:40-60`, `src/pkg/config/validate.go:202-225`).
 
 Run:
 
@@ -554,10 +566,11 @@ Run:
    Pushover receipt, or PagerDuty incident/event link.
 3. Save hive evidence showing the event entered the dispatcher and the provider
    sink delivered it. Dispatch queues events by severity and logs/audits
-   `escalation_delivery_failed` on repeated sink failure
-   (`src/pkg/escalate/dispatcher.go:78-123`). Provider delivery paths are
-   `ntfy`, `pushover`, and `pagerduty` (`src/pkg/escalate/push.go:22-38`,
-   `src/pkg/escalate/push.go:54-72`, `src/pkg/escalate/push.go:81-102`).
+   `escalation_delivery_failed` once a delivery's bounded retries run out or
+   the provider rejects it outright (`Dispatch` and `deliver`,
+   `src/pkg/escalate/dispatcher.go:91-161`). Provider delivery paths are
+   `ntfy`, `pushover`, and `pagerduty` (`src/pkg/escalate/push.go:45-63`,
+   `src/pkg/escalate/push.go:89-117`, `src/pkg/escalate/push.go:126-147`).
 
 Evidence checklist:
 

@@ -67,7 +67,7 @@ The last row is the only inbound trigger in the system, and it is not GitHub.
   `responder.go:224`);
 - agent resolution is `SessionAgent`: the named agent, else the only
   configured agent, else an error activity naming the missing config
-  (`src/pkg/config/config.go:1688`).
+  (`src/pkg/config/work_sources.go:116`).
 
 **The reply half.** `AgentCapabilities.Converse` is documented in exactly the
 words this feature needs — "An ADVISORY agent with Converse can reply on a
@@ -89,7 +89,7 @@ and dispatches on `X-GitHub-Event` (`src/pkg/hub/webhook.go:53`), today for
 `pkg/channels` runtime meant to serve them was never wired into the binary,
 declaring one validated cleanly while suppressing governor kicks, and the agent
 sat permanently dormant with no diagnostics. The types were removed and
-`ValidateChannels` now rejects them (`src/pkg/config/config.go:5538`, #5591).
+`ValidateChannels` now rejects them (`src/pkg/config/validate.go:379`, #5591).
 A mention trigger is a new channel type, and it must land with its runtime in
 the same PR — never as a config key first.
 
@@ -112,6 +112,13 @@ spoke already does for everything else:
    (`Issues.ListComments` / `PullRequests.ListComments` with `since`), plus
    issues opened since it. One or two calls per repo per tick; the watermark is
    the newest `updated_at` seen, persisted with the other `/data` ledgers.
+   The store (`/data/github-mention-triggers.json`, `mention.NewStore` in
+   `src/pkg/mention/store.go`) is replaced atomically (temp file, fsync,
+   rename). A file that still fails to parse is moved aside to
+   `*.corrupt-<unix-nanos>` and the store starts empty — the watermark
+   re-seeds to now, so older comments are not replayed — instead of
+   disabling mentions. Dedupe keys age out after 45 days, longer than
+   GitHub's 35-day workflow-run limit that bounds Actions run-key replays.
 2. Filter to bodies that mention the App login and pass the guards below.
 3. Hand each surviving mention to the same responder shape Linear uses.
 
@@ -191,8 +198,11 @@ mentioning comment (`Reactions.CreateIssueCommentReaction`; the hive already
 uses reactions for fleet-report dedupe, `src/pkg/github/fleet_report.go:42`).
 It is the GitHub analogue of Linear's `thought` ack — cheap, non-textual, and
 tells the human the mention was heard without a comment that would itself be a
-target for the loop guard. It is posted only after every guard has passed, so
-a declined mention gets no reaction (see *No oracle* below).
+target for the loop guard. It is posted only after every guard has passed and
+the kick was delivered, so a declined or undelivered mention gets no reaction
+(see *No oracle* below). A failed reaction on a delivered kick — a locked issue
+answers 403 — is recorded on the `agent_mention_kicked` entry as `ack=failed`
+and never retried, because a retry would kick the agent twice.
 
 ## Guards
 
@@ -202,7 +212,7 @@ mechanism that already exists; none is new policy.
 
 1. **Who may summon — fail closed.** A mention is honoured only from a login
    the hive already trusts, using the dashboard's own role list
-   (`DashboardConfig.AuthorizedRole`, `src/pkg/config/config.go:4218`) at
+   (`DashboardConfig.AuthorizedRole`, `src/pkg/config/dashboard_config.go:240`) at
    `read-write` or above by default — the same lookup `trustedMergerFunc`
    uses for the merge queue (`src/cmd/hive/merge_eligibility.go:50`). An explicit
    `github.mentions.summoners` list widens it. No configuration means the
@@ -295,7 +305,13 @@ agents:
   as the watchers (`src/pkg/github/attribution.go`).
 - `agent_mention_declined` — one entry per dropped mention with the guard that
   dropped it (`unauthorized`, `rate-limited`, `thread-cap`, `loop`,
-  `no-agent`, `ioscan`), never the body.
+  `no-agent`, `ioscan`, `thread-count-failed`, `kick-failed`), never the body.
+- A mention that passed every guard but whose thread count or kick failed is
+  retried on later polls without stalling the mentions after it: the poller
+  holds the repo watermark at the failed mention's creation time and keeps
+  going, and the failed attempt returns its per-user and per-repo rate-limit
+  tokens. After three failed attempts it is declined as `thread-count-failed`
+  or `kick-failed` and marked, so it cannot hold the watermark forever.
 - Kick history rows carry `source=mention`, so the dashboard's agent card and
   the kick outcome classifier (#7421) can say the turn was summoned, and the
   per-agent "last kick" no longer implies a cadence fired.
@@ -338,7 +354,7 @@ the decision follows each one, with the code on `v6` that now carries it.
    for `merger`: a summon spends tokens on someone else's request.
    **Decided: `read-write`, operator-overridable** — `DefaultMentionMinRole =
    RoleReadWrite` with `GitHubMentionsConfig.MinRoleEffective()`,
-   `src/pkg/config/config.go` on `v6`.
+   `src/pkg/config/github_integration_config.go` on `v6`.
 2. **PR review comments.** `pull_request_review_comment` mentions land inside a
    review thread; should the reply go in-thread (the #7360 reply path, capped
    by `max_attempts_per_thread`) or as a PR-level comment? In-thread is more
@@ -360,8 +376,8 @@ the decision follows each one, with the code on `v6` that now carries it.
 - `src/pkg/linearagent/oauth.go:56` — `app:mentionable`.
 - `src/pkg/agent/capabilities.go:32` — `Converse`, documented for mentions.
 - `src/pkg/proxy/rules.go:152,170` — where `Converse` is enforced.
-- `src/pkg/config/config.go:1716` — `linear.session_agent` resolution rule.
-- `src/pkg/config/config.go:5538` — the removed declarative channel types (#5591).
+- `src/pkg/config/work_sources.go:116` — `linear.session_agent` resolution rule.
+- `src/pkg/config/validate.go:379` — the removed declarative channel types (#5591).
 - `src/pkg/config/review_bots.go:32` — `classification.review_bots`, the loop
   list.
 - `src/pkg/github/review_request_watcher.go`, `review_threads.go` — the
@@ -398,4 +414,4 @@ Action-originated comments keep the existing mention guards and add transport-sp
 
 Transport B, OIDC dispatch, is the direct path for workflows that can reach the target hive's dashboard. The composite action requests a GitHub Actions OIDC token with `permissions: id-token: write`, an audience pinned to `github.actions.oidc.audience`, and posts to `POST <hive_url>/api/contribute/actions/dispatch` with `{command,prompt,issue,run_id,run_attempt}`. `hive_url` is the dashboard of the hive that governs the repository: the route is registered only by the spoke dashboard (`src/pkg/dashboard/api_contribute.go`), whose agents receive the kick, and the hub does not serve it. The body run fields are optional compatibility fields and must match the token claims when present. The endpoint lives under `/api/contribute/` so a hosted spoke's existing `/api/contribute` ingress (public, with the hub's auth-check forwarding identity headers) already routes it to the hive.
 
-The hive dashboard verifies the token against the GitHub Actions issuer (`https://token.actions.githubusercontent.com`) and JWKS, rejects wrong `aud`, `iss`, expired/not-yet-valid tokens, and requires `run_id`, `run_attempt`, and `jti`. It then maps the verified claims into the same action guard path as transport A: `repository` must be governed, `actor` maps through `github.actions.identity_map` or an existing dashboard identity, bot actors remain constrained by `github.actions.allowed_commands`, and apply-like `kick` commands still require owner plus `github.actions.allow_apply: true`. The prompt is scanned with `ioscan.EnforceInput` before kick text is built. Dedupe shares transport A's store and key shape (`repo + claim run_id + claim run_attempt`), and the store records the claim `jti` as an additional seen key. Audit entries use `source=action` and add `transport=comment` or `transport=oidc`, plus OIDC `workflow` and `ref`, so operators can distinguish the relay path without creating a new authorization surface.
+The hive dashboard verifies the token against the GitHub Actions issuer (`https://token.actions.githubusercontent.com`) and JWKS, rejects wrong `aud`, `iss`, expired/not-yet-valid tokens, and requires `run_id`, `run_attempt`, and `jti`. It then maps the verified claims into the same action guard path as transport A: `repository` must be governed, `actor` maps through `github.actions.identity_map` or an existing dashboard identity, bot actors remain constrained by `github.actions.allowed_commands`, and apply-like `kick` commands still require owner plus `github.actions.allow_apply: true`. The prompt is scanned with `ioscan.EnforceInput` before kick text is built. Dedupe shares transport A's store and key shape (`repo + claim run_id + claim run_attempt`), and the store records the claim `jti` as an additional seen key. If the dashboard has no mention store loaded, the endpoint refuses with `503` (audit `guard=store`) rather than dispatching without replay dedupe. Audit entries use `source=action` and add `transport=comment` or `transport=oidc`, plus OIDC `workflow` and `ref`, so operators can distinguish the relay path without creating a new authorization surface.

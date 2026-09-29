@@ -507,6 +507,10 @@ func nextInstallationID(current int64, ghCfg *spoke.HeartbeatGitHubAppConfig) (n
 
 var githubAppTokenCachePath = github.TokenCachePath
 
+// resumeKickHeldAlerts tracks crash-restarted agents the resume-kick gate
+// refused, so the eval loop can raise and later clear their dashboard alert.
+var resumeKickHeldAlerts = spokealerts.NewResumeKickHeld()
+
 func githubAppTokenHeartbeatFields(cfg *config.Config, detail string) (status, lastMintAt, lastErr string) {
 	if cfg == nil || !cfg.GitHub.HasApp() {
 		return "", "", ""
@@ -2461,6 +2465,9 @@ func (b *boot) bootAgentsWith(deps bootAgentsDeps) {
 		autoMergeOpts.MutationBoundary = b.mutationBoundary
 		autoMergeOpts.SelfAuthorizationHoldEnabled = selfAuthorizationHoldEnabled
 		autoMergeOpts.RepoAutoMergeEnabled = func(repo string) bool { return b.cfg.RepoAutoMergeEnabled(repo) }
+		// Read through b.cfg on every sweep tick so a config reload of
+		// auto_merge.trusted_bot_authors takes effect without a restart.
+		autoMergeOpts.TrustedBotAuthors = func() map[string]bool { return b.cfg.AutoMerge.TrustedBotAuthorSet() }
 		// Intent tier gate (#6258): the human lane only queues PRs that
 		// survive writeMergeEligible's intent check, but this sweep lists
 		// the App's PRs on its own, so it carries the same policy (same
@@ -2749,7 +2756,10 @@ func (b *boot) bootDashboardWith(deps bootDashboardDeps) {
 	if b.cfg.GitHub.Mentions.Enabled || b.cfg.GitHub.Actions.OIDC.Enabled {
 		store, err := mention.NewStore("/data/github-mention-triggers.json")
 		if err != nil {
-			b.logger.Warn("mention trigger store unavailable", "error", err)
+			// Parse failures self-heal inside NewStore; reaching here means the
+			// file is unreadable or cannot be moved aside, which disables GitHub
+			// mentions and makes Actions OIDC dispatch refuse (503) until fixed.
+			b.logger.Error("mention trigger store unavailable; GitHub mentions disabled and Actions OIDC dispatch will refuse", "error", err)
 		} else {
 			b.mentionStore = store
 			mentionStore = store
@@ -6275,7 +6285,11 @@ func planFromLabeledIssues(
 		}
 	}
 	if cfg != nil && cfg.Runs.Spektacular.Enabled && dashSrv != nil {
-		filtered := issues[:0]
+		// issues may alias actionable.Issues.Items (when PlanFromLabelEnabled),
+		// which is already published to lastActionable/dashboard readers, so we
+		// must never compact it in place (issues[:0]) — allocate a fresh backing
+		// array instead.
+		filtered := make([]github.Issue, 0, len(issues))
 		for _, issue := range issues {
 			if planning.HasDesignLabel(issue, designCfg) {
 				if epic, runKey, err := dashSrv.StartDesignSpektacularFromIssue(context.Background(), store, issue); err != nil {
@@ -6890,7 +6904,19 @@ func runEvalCycle(
 	// burning backend tokens far faster than any configured cadence and
 	// bypassing the budget gate; AllowResumeKick bounds resume kicks to one
 	// per cadence interval and respects mode pauses and the budget.
-	agentsDue = mergeResumeKicks(agentsDue, restartedAgents, gov.AllowResumeKick, logger)
+	// Refused restarts are not silent: the agent sits at an empty prompt
+	// until its slot, so raise a per-agent alert (with an OOM hint when the
+	// cgroup killed the CLI) and clear it once any kick reaches the agent.
+	var resumeHeld []string
+	agentsDue, resumeHeld = mergeResumeKicks(agentsDue, restartedAgents, gov.AllowResumeKick, logger)
+	resumeKickHeldAlerts.Apply(dashSrv, resumeHeld, agentMgr.CrashOOMSuspected)
+	resumeKickHeldAlerts.ClearKicked(dashSrv, func(name string) (time.Time, bool) {
+		st, err := agentMgr.GetStatusFast(name)
+		if err != nil || st == nil || st.LastKick == nil {
+			return time.Time{}, false
+		}
+		return *st.LastKick, true
+	})
 
 	govState := gov.GetState()
 	span.SetAttributes(
@@ -9509,12 +9535,14 @@ func dispatchSubcommand(args []string, stdout, stderr io.Writer) (bool, int) {
 	}
 }
 
-// chatDashboardToken is the bearer token the chat services use to call the
-// local dashboard API. It must be the same token the dashboard middleware
-// accepts (config.Dashboard.AuthToken, resolved from DASHBOARD_AUTH_TOKEN,
-// HIVE_DASHBOARD_TOKEN or the token file). Reading only HIVE_DASHBOARD_TOKEN
-// left hosted spokes — which mount a token file — sending no Authorization
-// at all, so every `!runs`, heartbeat and spec-start call answered 401.
+// chatDashboardToken is the shared token the chat services present to the
+// local dashboard API (as X-Hive-Internal, the server-to-server credential the
+// middleware honors on direct-route spokes too — #9134). It must be the same
+// token the dashboard middleware accepts (config.Dashboard.AuthToken, resolved
+// from DASHBOARD_AUTH_TOKEN, HIVE_DASHBOARD_TOKEN or the token file). Reading
+// only HIVE_DASHBOARD_TOKEN left hosted spokes — which mount a token file —
+// sending no credential at all, so every `!runs`, heartbeat and spec-start
+// call answered 401.
 func (b *boot) chatDashboardToken() string {
 	if b != nil && b.cfg != nil && b.cfg.Dashboard.AuthToken != "" {
 		return b.cfg.Dashboard.AuthToken
