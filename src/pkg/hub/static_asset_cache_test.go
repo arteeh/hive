@@ -1,10 +1,14 @@
 package hub
 
 import (
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/hivecommons/hive/pkg/dashboard/webstatic"
 )
 
 func TestStaticAssetCacheRevalidation(t *testing.T) {
@@ -14,6 +18,14 @@ func TestStaticAssetCacheRevalidation(t *testing.T) {
 			w := httptest.NewRecorder()
 			s.mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, url, nil))
 			etag := w.Header().Get("ETag")
+			data, err := fs.ReadFile(staticFS, strings.TrimPrefix(url, "/"))
+			if err != nil {
+				t.Fatalf("read embedded %s: %v", url, err)
+			}
+			// Same validator format as the hub's HTML handlers (#9676).
+			if want := webstatic.ETagFor(data); etag != want {
+				t.Fatalf("ETag = %q, want shared ETagFor value %q", etag, want)
+			}
 			if w.Code != http.StatusOK || etag == "" || w.Header().Get("Cache-Control") != "no-cache" {
 				t.Fatalf("initial response: status=%d headers=%v", w.Code, w.Header())
 			}
