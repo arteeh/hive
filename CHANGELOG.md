@@ -11,6 +11,12 @@ Hive did not historically maintain a complete changelog. This file starts a prag
 
 ## Unreleased
 
+## 2026-10-03 (v5.130.2)
+
+### Fixed
+
+- Match configured review-bot logins with or without the `[bot]` suffix so Codex GraphQL threads are discovered and can be replied to and resolved ([#10478](https://github.com/hivecommons/hive/issues/10478)).
+
 ## 2026-10-03 (v5.130.1)
 
 ### Fixed
