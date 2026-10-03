@@ -6605,7 +6605,7 @@
       const rows = a.subAgentModels || [];
       if (!rows.length) return '';
       return `<div class="oc-subagent-models"><strong>Observed sub-agent models</strong><ul>${rows.map(row =>
-        `<li>${esc(row.agentType)} → <code>${esc(row.model)}</code>${row.olderGeneration ? ' <span style="color:var(--status-warn)" title="Older model generation than the parent launch model">⚠ older generation</span>' : ''}</li>`
+        `<li>${esc(row.agentType)} → <code>${esc(row.model)}</code>${row.olderGeneration ? ' <span class="text-warn" title="Older model generation than the parent launch model">⚠ older generation</span>' : ''}</li>`
       ).join('')}</ul></div>`;
     }
 
