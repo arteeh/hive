@@ -251,6 +251,13 @@ type KickMessage struct {
 }
 
 func (s *Scheduler) BuildKickMessages(actionable *github.ActionableResult, agentsDue []string) []KickMessage {
+	messages, _ := s.BuildKickMessagesWithSkips(actionable, agentsDue)
+	return messages
+}
+
+// BuildKickMessagesWithSkips also explains due targets that produced no kick,
+// so the governor does not log an intentionally idle lane as a delivery attempt.
+func (s *Scheduler) BuildKickMessagesWithSkips(actionable *github.ActionableResult, agentsDue []string) ([]KickMessage, []string) {
 	s.resetClassifierBudget()
 	classifiedIssues := classify.ClassifyAll(actionable.Issues.Items)
 	s.recordClassified(classifiedIssues)
@@ -258,6 +265,7 @@ func (s *Scheduler) BuildKickMessages(actionable *github.ActionableResult, agent
 	s.offerQuestions(classifiedIssues)
 
 	var messages []KickMessage
+	var skipped []string
 	for _, targetKey := range agentsDue {
 		agentName, repo := config.SplitCadenceTargetKey(targetKey)
 		targetActionable := actionableForRepo(actionable, repo)
@@ -267,6 +275,7 @@ func (s *Scheduler) BuildKickMessages(actionable *github.ActionableResult, agent
 		}
 		msg, idleReason := s.buildAgentMessageFor(agentName, repo, s.kickIncludesRepos(agentName), targetIssues, targetActionable)
 		if idleReason != "" {
+			skipped = append(skipped, targetKey+" ("+idleReason+")")
 			// The reviewer lane is dormant or has nothing to adjudicate
 			// (#11046): skip the kick rather than spend a model turn on a
 			// stand-down. Nothing is dispatched, so no LastKick is recorded
@@ -277,7 +286,9 @@ func (s *Scheduler) BuildKickMessages(actionable *github.ActionableResult, agent
 			}
 			continue
 		}
-		if msg != "" {
+		if msg == "" {
+			skipped = append(skipped, targetKey+" (kick message withheld)")
+		} else {
 			// The canary is the one thing that goes AHEAD of the static
 			// prefix: it is random by construction and prepended to the kick
 			// (ADR-0008, pkg/ioscan/canary.go), and both properties are what
@@ -294,7 +305,7 @@ func (s *Scheduler) BuildKickMessages(actionable *github.ActionableResult, agent
 			})
 		}
 	}
-	return messages
+	return messages, skipped
 }
 
 func (s *Scheduler) selectReviewModel(agentCfg config.AgentConfig, pr github.PullRequest) (string, string, bool) {

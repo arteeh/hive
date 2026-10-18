@@ -1,0 +1,1 @@
+- Failed pane writes and rejected kick deliveries now reach the governor and kick-status error paths without recording success; repeated write failures use the existing undeliverable reporting, and idle reviewer lanes appear as skipped in governor evaluation logs ([#12846](https://github.com/hivecommons/hive/issues/12846)).

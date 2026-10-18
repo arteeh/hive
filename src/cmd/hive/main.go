@@ -7020,14 +7020,6 @@ func runEvalCycle(
 		return ""
 	})
 
-	logger.Info("governor eval complete",
-		"mode", govState.Mode,
-		"issues", govState.QueueIssues,
-		"prs", govState.QueuePRs,
-		"agents_due", agentsDue,
-		"agents_skipped", agentsSkipped,
-	)
-
 	// PROVIDER SPEND REBUFF (#4294). When the inference gateway is refusing on a
 	// money limit, every kick launched this cycle is a run that cannot buy a
 	// single token — precisely the failure this addresses: a hive that kept
@@ -7126,7 +7118,23 @@ func runEvalCycle(
 	if ghClient != nil {
 		applyReviewPriorityLabels(ctx, cfg, ghClient, reviewQueue, logger)
 	}
-	messages := sched.BuildKickMessages(kickActionable, agentsDue)
+	messages, messageSkips := sched.BuildKickMessagesWithSkips(kickActionable, agentsDue)
+	agentsSkipped = append(agentsSkipped, messageSkips...)
+	// Message construction can withhold a due kick (notably an idle reviewer
+	// lane). Report only assembled targets as due, without recording a fake
+	// LastKick: new lane work must still be eligible on the next evaluation.
+	assembledTargets := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		assembledTargets = append(assembledTargets, config.CadenceTargetKey(msg.Agent, msg.Repo))
+	}
+	logger.Info("governor eval complete",
+		"mode", govState.Mode,
+		"issues", govState.QueueIssues,
+		"prs", govState.QueuePRs,
+		"agents_due", assembledTargets,
+		"agents_skipped", agentsSkipped,
+	)
+
 	reviewKickByMessage := map[string]review.DispatchKick{}
 	for _, k := range append(reviewPlan.ReviewKicks, reviewPlan.FixKicks...) {
 		if !gov.AgentEligibleForCELKick(k.Agent) || agentMgr.IsPaused(k.Agent) {

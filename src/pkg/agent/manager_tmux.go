@@ -550,12 +550,12 @@ func (m *Manager) tmuxSessionHasAttachedClientForAgent(agent *AgentProcess) bool
 }
 
 // tmuxSendLiteralForAgent sends text using the agent's tmux socket.
-func (m *Manager) tmuxSendLiteralForAgent(agent *AgentProcess, text string) {
-	m.terminalSession().SendLiteral(agent, text)
+func (m *Manager) tmuxSendLiteralForAgent(agent *AgentProcess, text string) error {
+	return m.terminalSession().SendLiteral(agent, text)
 }
 
 // tmuxSendEntersForAgent sends Enter presses using the agent's tmux socket.
-func (m *Manager) tmuxSendEntersForAgent(agent *AgentProcess) {
+func (m *Manager) tmuxSendEntersForAgent(agent *AgentProcess) error {
 	for i := 0; i < enterCount; i++ {
 		// The repeat exists only to make sure a typed line actually RAN — it is
 		// insurance against a pane that swallowed the first Enter. Once
@@ -571,18 +571,21 @@ func (m *Manager) tmuxSendEntersForAgent(agent *AgentProcess) {
 		if i > 0 && paneHasBlockingPrompt(m.captureVisiblePaneForAgent(agent)) {
 			m.logger.Info("stopping repeat Enter: a prompt is awaiting an answer",
 				"agent", agent.Name, "sent", i)
-			return
+			return nil
 		}
-		_ = m.tmuxCmd(agent, "send-keys", "-t", agent.tmuxSession, "Enter").Run()
+		if err := m.tmuxSendKeysForAgent(agent, "Enter"); err != nil {
+			return err
+		}
 		if i < enterCount-1 {
 			time.Sleep(enterDelay)
 		}
 	}
+	return nil
 }
 
 // tmuxSendKeysForAgent sends key sequences (C-c, C-u, etc.) using the agent's tmux socket.
-func (m *Manager) tmuxSendKeysForAgent(agent *AgentProcess, keys ...string) {
-	m.terminalSession().SendKeys(agent, keys...)
+func (m *Manager) tmuxSendKeysForAgent(agent *AgentProcess, keys ...string) error {
+	return m.terminalSession().SendKeys(agent, keys...)
 }
 
 // attachedClientIdleGrace is how long a tmux client may sit with no activity

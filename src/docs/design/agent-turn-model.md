@@ -53,9 +53,9 @@ turns. `launchInTmux` creates a detached shell session
 invocation into that shell*:
 
 ```go
-m.tmuxSendLiteralForAgent(agent, fullCmd)   // src/pkg/agent/manager_tmux.go:499
+m.tmuxSendLiteralForAgent(agent, fullCmd)   // src/pkg/agent/manager_tmux.go:553
 time.Sleep(textToEnterDelay)
-m.tmuxSendEntersForAgent(agent)             // src/pkg/agent/manager_tmux.go:504
+m.tmuxSendEntersForAgent(agent)             // src/pkg/agent/manager_tmux.go:558
 ```
 
 The composed command line is per-backend and is built as a string —
@@ -64,19 +64,27 @@ The composed command line is per-backend and is built as a string —
 (`src/pkg/agent/manager_launch.go:888`), and so on.
 
 Nothing in the kick path ever spawns a process. `deliverKickLocked`
-(`src/pkg/agent/manager_kick.go:252`) only manipulates the existing pane.
+(`src/pkg/agent/manager_kick.go:242`) only manipulates the existing pane.
 
 ### 1.2 A turn starts with simulated keystrokes
 
-`SendKick` (`src/pkg/agent/manager_kick.go:110`) is the entry point; it delegates to
-`deliverKickLocked` (`src/pkg/agent/manager_kick.go:252`), which:
+`SendKick` (`src/pkg/agent/manager_kick.go:102`) is the entry point; it delegates to
+`deliverKickLocked` (`src/pkg/agent/manager_kick.go:242`), which:
 
-- clears any stale input with `C-c` then `C-u`
-  (`src/pkg/agent/manager_kick.go:280-283`),
+- clears stale input with `C-c` then `C-u` (Codex uses only `C-u`; Goose skips clearing)
+  (`src/pkg/agent/manager_kick.go:285-296`),
 - types the prompt literally, chunked, via
-  `tmuxSendLiteralForAgent` (`src/pkg/agent/manager_kick.go:317`, implementation at
-  `src/pkg/agent/manager_tmux.go:499` → `tmux send-keys -l`),
-- submits with `tmuxSendEntersForAgent` (`src/pkg/agent/manager_kick.go:344`).
+  `tmuxSendLiteralForAgent` (`src/pkg/agent/manager_kick.go:332`, implementation at
+  `src/pkg/agent/manager_tmux.go:553` → `tmux send-keys -l`),
+- submits with `tmuxSendEntersForAgent` (`src/pkg/agent/manager_kick.go:363`).
+
+Pane writes return errors to the kick caller. A failed clear, prompt chunk, or
+Enter stops delivery, increments the existing undeliverable counter, and leaves
+`LastKick` and successful-kick history unchanged. A final readiness refusal or
+restart during chunk delivery also returns an error, so synchronous dispatch
+and asynchronous kick status cannot mistake a skipped delivery for success.
+The governor evaluation log lists idle reviewer lanes under `agents_skipped`;
+no synthetic kick timestamp delays their next check for work.
 
 The prompt reaches the model the same way a human's keyboard would. There is no
 API call, no stdin pipe, and no structured request that hive could inspect,
@@ -92,7 +100,7 @@ text**, by two independent mechanisms:
 `waitForInputPromptForAgent` (`src/pkg/agent/manager_tmux.go:452`) polls
 `captureTmuxPaneForAgent` and returns once `paneShowsInputPrompt`
 (`src/pkg/agent/manager_pane_signals.go:343`) matches a per-backend marker string. `SendKick`
-calls it at `src/pkg/agent/manager_kick.go:110`. This gate is the only thing that
+calls it at `src/pkg/agent/manager_kick.go:102`. This gate is the only thing that
 stops hive typing a new prompt on top of an in-flight response.
 
 The gate is bounded by `inputPromptTimeout` (120s), which is why operator kicks
@@ -112,9 +120,9 @@ captured pane content to maintain `agent.LastPaneChange`
 authenticated CLI is actually doing something.
 
 Stall recovery is likewise textual: `nudgeIfKickStalled`
-(`src/pkg/agent/manager_kick.go:805`) compares `paneContentHash(pane)` against
-`agent.lastInferKickPane` (`src/pkg/agent/manager_kick.go:833`), and
-`paneShowsActiveWork` (`src/pkg/agent/manager_kick.go:729`) matches a spinner or a
+(`src/pkg/agent/manager_kick.go:907`) compares `paneContentHash(pane)` against
+`agent.lastInferKickPane` (`src/pkg/agent/manager_kick.go:880`), and
+`paneShowsActiveWork` (`src/pkg/agent/manager_kick.go:823`) matches a spinner or a
 token-counter marker.
 
 ### 1.4 Scheduling: one shared ticker, not a per-turn continuation
@@ -130,8 +138,8 @@ Kick *timing* lives in `pkg/governor`; kick *text* is built in `pkg/scheduler`.
 - The driving loop is a single ticker in `main`:
   `time.NewTicker(… EvalIntervalS …)` at `src/cmd/hive/main.go:5143`, loop at
   `src/cmd/hive/main.go:5164`, evaluation at `src/cmd/hive/main.go:5798`,
-  message assembly via `sched.BuildKickMessages` at `src/cmd/hive/main.go:6076`
-  (`src/pkg/scheduler/kickmessage.go:130`), and delivery via
+  message assembly via `sched.BuildKickMessagesWithSkips` at `src/cmd/hive/main.go:7121`
+  (`src/pkg/scheduler/kickmessage.go:260`), and delivery via
   `agentMgr.SendKick` at `src/cmd/hive/main.go:6153`.
 
 This matters for the RFC: the scheduler is already **stateless with respect to
@@ -292,7 +300,7 @@ directly: `RestartWithBootstrap` (`src/pkg/agent/manager_restart.go:371`) sets
 `BootstrapOverride`, and `RestartThenSendKick`
 (`src/pkg/agent/manager_restart.go:451`) is documented as restarting "with a clean
 slate". Whichever path runs, delivery is gated on the new pane reaching its
-input marker (`deliverStartupKick`, `src/pkg/agent/manager_kick.go:410`).
+input marker (`deliverStartupKick`, `src/pkg/agent/manager_kick.go:480`).
 
 **Restart is a reset, not a resume.** Whatever the agent had established in its
 conversation — plan, working context, partial tool results — is gone, and the
@@ -386,7 +394,7 @@ It is easy to mistake either for one; neither is.
   asked to do?" (`src/pkg/dashboard/prompt_history.go:22-35`). No model
   response, tool call, or tool result is recorded.
 - `/data/logs/kicks/…` holds **rendered terminal text**, captured with
-  `tmux capture-pane -p -J` (`src/pkg/agent/terminal.go:107-109`). It is a
+  `tmux capture-pane -p -J` (`src/pkg/agent/terminal.go:109-111`). It is a
   human debugging artifact, retained to 10 files / 64 MiB per agent
   (`src/pkg/agent/kick_logs.go:51`, `:60`). It contains ANSI-rendered,
   width-wrapped, spinner-animated output with no message boundaries and no
@@ -415,7 +423,7 @@ rather than a new one to invent.
 
 This is the load-bearing constraint behind all of the above and is worth
 isolating. Turn completion (§1.3), liveness classification (§4), stall
-detection (`src/pkg/agent/manager_kick.go:805`), auth failure
+detection (`src/pkg/agent/manager_kick.go:907`), auth failure
 (`src/pkg/watchdog/classify.go:99-104`), quota exhaustion
 (`src/pkg/agent/manager.go:295`), and even whether a surviving CLI can be
 adopted (`src/pkg/agent/manager_tmux.go:397`) are all decided by matching substrings

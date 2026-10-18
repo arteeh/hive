@@ -19,6 +19,8 @@ type funcTerminal struct {
 	sessionAttached          func(*AgentProcess) bool
 	sendLiteral              func(*AgentProcess, string)
 	sendKeys                 func(*AgentProcess, ...string)
+	sendLiteralErr           func(*AgentProcess, string) error
+	sendKeysErr              func(*AgentProcess, ...string) error
 	sleepDuringPromptDismiss func(time.Duration)
 	captureFullLog           func(*AgentProcess) (string, error)
 	clearHistory             func(*AgentProcess)
@@ -45,16 +47,24 @@ func (f funcTerminal) SessionAttached(agent *AgentProcess) bool {
 	return true
 }
 
-func (f funcTerminal) SendLiteral(agent *AgentProcess, text string) {
+func (f funcTerminal) SendLiteral(agent *AgentProcess, text string) error {
+	if f.sendLiteralErr != nil {
+		return f.sendLiteralErr(agent, text)
+	}
 	if f.sendLiteral != nil {
 		f.sendLiteral(agent, text)
 	}
+	return nil
 }
 
-func (f funcTerminal) SendKeys(agent *AgentProcess, keys ...string) {
+func (f funcTerminal) SendKeys(agent *AgentProcess, keys ...string) error {
+	if f.sendKeysErr != nil {
+		return f.sendKeysErr(agent, keys...)
+	}
 	if f.sendKeys != nil {
 		f.sendKeys(agent, keys...)
 	}
+	return nil
 }
 
 func (f funcTerminal) SleepDuringPromptDismiss(d time.Duration) {
