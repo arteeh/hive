@@ -7121,8 +7121,9 @@ func runEvalCycle(
 	messages, messageSkips := sched.BuildKickMessagesWithSkips(kickActionable, agentsDue)
 	agentsSkipped = append(agentsSkipped, messageSkips...)
 	// Message construction can withhold a due kick (notably an idle reviewer
-	// lane). Report only assembled targets as due, without recording a fake
-	// LastKick: new lane work must still be eligible on the next evaluation.
+	// lane). Report only assembled targets as due. Skipped targets dispatch
+	// nothing, so (as before) no LastKick is recorded for them and new lane
+	// work stays eligible on the next evaluation.
 	assembledTargets := make([]string, 0, len(messages))
 	for _, msg := range messages {
 		assembledTargets = append(assembledTargets, config.CadenceTargetKey(msg.Agent, msg.Repo))

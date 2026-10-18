@@ -97,7 +97,7 @@ turns, so there is no exit to wait for. Turn completion is **inferred from pane
 text**, by two independent mechanisms:
 
 **The readiness gate before the next kick.**
-`waitForInputPromptForAgent` (`src/pkg/agent/manager_tmux.go:452`) polls
+`waitForInputPromptForAgent` (`src/pkg/agent/manager_tmux.go:496`) polls
 `captureTmuxPaneForAgent` and returns once `paneShowsInputPrompt`
 (`src/pkg/agent/manager_pane_signals.go:343`) matches a per-backend marker string. `SendKick`
 calls it at `src/pkg/agent/manager_kick.go:102`. This gate is the only thing that
@@ -130,17 +130,18 @@ token-counter marker.
 **Correction to the task framing: `src/pkg/agent/scheduler.go` does not exist.**
 Kick *timing* lives in `pkg/governor`; kick *text* is built in `pkg/scheduler`.
 
-- `Governor.agentsDueForKick` (`src/pkg/governor/governor.go:787`) compares
+- `Governor.agentsDueForKick` (`src/pkg/governor/governor.go:887`) compares
   `now - LastKick` against each agent's configured cadence
   (`AgentCadence`, `src/pkg/governor/governor.go:25`).
-- `Governor.Evaluate` (`src/pkg/governor/governor.go:323`) calls it at
-  `src/pkg/governor/governor.go:420` and returns the due list.
+- `Governor.Evaluate` (`src/pkg/governor/governor.go:377`) calls it at
+  `src/pkg/governor/governor.go:485` and returns the due list.
 - The driving loop is a single ticker in `main`:
-  `time.NewTicker(… EvalIntervalS …)` at `src/cmd/hive/main.go:5143`, loop at
-  `src/cmd/hive/main.go:5164`, evaluation at `src/cmd/hive/main.go:5798`,
+  `deps.newTicker(initialEvalInterval)` at `src/cmd/hive/main.go:5883`, loop at
+  `src/cmd/hive/main.go:6113`, evaluation via `deps.runEval` at
+  `src/cmd/hive/main.go:6032` (`runEvalCycle`, `src/cmd/hive/main.go:6697`),
   message assembly via `sched.BuildKickMessagesWithSkips` at `src/cmd/hive/main.go:7121`
   (`src/pkg/scheduler/kickmessage.go:260`), and delivery via
-  `agentMgr.SendKick` at `src/cmd/hive/main.go:6153`.
+  `agentMgr.SendKick` wired into `dispatchAgentKicks` at `src/cmd/hive/main.go:7226`.
 
 This matters for the RFC: the scheduler is already **stateless with respect to
 turns**. It does not hold a continuation, does not await turn *N* before

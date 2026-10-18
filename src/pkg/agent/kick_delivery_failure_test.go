@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hivecommons/hive/internal/testutil"
 	"github.com/hivecommons/hive/pkg/fleetreport"
 )
 
@@ -101,19 +102,12 @@ func TestSendKickPropagatesFinalDeliveryFailure(t *testing.T) {
 					if !started || err != nil {
 						t.Fatalf("queue delivery = %v, %v", started, err)
 					}
-					deadline := time.Now().Add(5 * time.Second)
-					for {
+					d := testutil.EventuallyValue(t, 5*time.Second, func() (KickDispatch, bool) {
 						d, _ := m.KickDispatchState(a.Name)
-						if !d.Pending() {
-							if d.Phase != KickPhaseFailed || d.Error == "" {
-								t.Fatalf("dispatch phase = %q, want failed", d.Phase)
-							}
-							break
-						}
-						if time.Now().After(deadline) {
-							t.Fatal("delivery did not settle")
-						}
-						time.Sleep(time.Millisecond)
+						return d, !d.Pending()
+					}, "delivery did not settle")
+					if d.Phase != KickPhaseFailed || d.Error == "" {
+						t.Fatalf("dispatch phase = %q, want failed", d.Phase)
 					}
 				} else if err := m.SendKick(a.Name, "task"); err == nil {
 					t.Fatal("SendKick returned success without delivering")
