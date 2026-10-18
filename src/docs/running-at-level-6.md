@@ -38,7 +38,7 @@ The third route is the human-approved queue (normally `lgtm`): an authorized mer
 | GitHub-blocked PR | Missing required checks/reviews, signatures, conflicts or branch rules still bind the merge. Satisfy the actual rule, not just the Hive pill. See [merge block reasons](../pkg/github/merge_block_reason.go) and [sweep](../pkg/github/automerge/automerge_sweep.go). |
 | PR escalated after failed fixes | The fix ledger parks exhausted repair work; `needs-human` is a triage signal, **not by itself a universal merge hold**. The scanner separates escalated rows; outside the self-authored review gate below, a green App PR may still merge. Add `hold` if the decision must prevent merging; repair/review, clear the escalation, then release the hold. See [escalation](../pkg/escalation/escalation.go), `writeMergeEligible` in [eligibility](../cmd/hive/merge_eligibility.go), and [sweep](../pkg/github/automerge/automerge_sweep.go). |
 | Behind/conflicting fork PR | A GitHub `behind` state triggers an update attempt in the sweep, not a guaranteed repair. The hive cannot assume write access to a contributor's fork. Author rebases/updates the fork, resolves conflicts and reruns CI; a fork merely older than base is not blocked unless GitHub requires freshness or reports a conflict. See [sweep](../pkg/github/automerge/automerge_sweep.go) and `UpdateBranch` in [pull requests](../pkg/github/pullrequest.go). |
-| Adopted PR with unsigned commits | `no-dco` cannot be fixed by adding a later empty signed commit. If the adopted branch can be pushed, the hive rewrites the unsigned commits with sign-off in place. If it cannot safely amend that history, adoption re-homes the work onto a hive-owned branch from the base, cherry-picks or squashes with `-s` while preserving original authorship/credit, opens a superseding PR, and closes the original. See [stage 074 adoption](labels-and-control-signals.md#off-the-happy-path-072--nudge--074--takeover). |
+| Adopted PR with unsigned commits | `no-dco` cannot be fixed by adding a later empty signed commit. If all unsigned commits are hive-authored (GitHub-linked to the App bot; git author emails never count) and the adopted branch can be pushed, the hive rewrites just its own unsigned commits with sign-off in place. If any unsigned commit is contributor-authored/unknown, or the branch cannot be pushed, adoption re-homes the work onto a hive-owned branch from the base, cherry-picks or squashes with `-s` while preserving original authorship/credit, opens a superseding PR, and closes the original. See [stage 074 adoption](labels-and-control-signals.md#off-the-happy-path-072--nudge--074--takeover). |
 | Issue parked for a maintainer decision | A human with repository write/maintain/admin permission comments `/hive approve` or `/hive decision <direction>`; the un-park sweep removes decision labels, never `hold`. Plain "approved" is insufficient. See [maintainer commands](maintainer-commands.md) and [un-park implementation](../pkg/github/issue_unpark_command.go). |
 
 ### Does the Hive reviewer stop a merge?
@@ -60,8 +60,14 @@ own enabling conditions. See `classifyMergeEligibility` in
 On Hive-authored PRs the default `review.self_authored_decision_policy: resolve`
 keeps low-stakes reviewer questions advisory: sequencing, naming, config-shape,
 scope, and "land now vs later" calls are the hive's own decision, so the
-aggregate can approve while preserving the question in the audit reason. Set
-the policy to `escalate` to restore the older behavior where every
+aggregate can approve while preserving the question in the audit reason. A
+non-risk incomplete-fix review that names concrete remediation is different:
+it is normalized from `requires_human` to `changes_requested` when verdicts are
+aggregated and loaded, even if the finding severity is high, so the review
+gate, every stage-label observer, human-entry comments, and fixer dispatch all
+see the fixer-lane verdict and the PR enters `stage/070-fixing` instead of
+parking for a person. Intent-alignment cleanup with an obvious fix, such as
+trimming a duplicate PR summary or changelog claim, follows the same route. Set the policy to `escalate` to restore the older behavior where every
 `needs-decision` marker parks the PR at `stage/085-needs-decision`. Risk
 questions still escalate either way: security, data loss, irreversible or
 public-facing behavior, policy/governance, licensing, spend, or unreadable

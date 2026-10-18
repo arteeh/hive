@@ -8,6 +8,7 @@ package automerge
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -419,6 +420,7 @@ func TestTrySweepContributorLanePRSkipReasons(t *testing.T) {
 		},
 		{name: "behind updates branch", mutate: func(fx *contributorLaneFixture) { fx.mergeableState = "behind" }, wantReason: "check-pending", wantUpdate: 1},
 		{name: "conflicting", mutate: func(fx *contributorLaneFixture) { fx.mergeableState = "dirty" }, wantReason: "conflicting"},
+		{name: "unknown mergeability waits", mutate: func(fx *contributorLaneFixture) { fx.mergeableState = "unknown" }, wantReason: "mergeable-unknown"},
 		{
 			name:       "reviewer configured without approval",
 			verdict:    func(string, int, string) ContributorLaneVerdict { return ContributorLaneVerdict{Configured: true} },
@@ -503,6 +505,49 @@ func TestTrySweepContributorLanePRMergeCommentText(t *testing.T) {
 	registry := contributorLaneMergeComment("@bob", contributorClaimMatch{RegistryTier: "trusted"}, 30*time.Minute, ContributorLaneVerdict{Configured: true, Approved: true})
 	if !strings.Contains(registry, "≥30m, reviewer verdict approve, @bob holds the trusted tier in this hive's contributor registry.") {
 		t.Fatalf("registry comment = %q", registry)
+	}
+}
+
+func TestTrySweepContributorLaneTrustedHumanApprovalClearsRequiresHuman(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		verdict    ContributorLaneVerdict
+		wantReason string
+		wantMerges int
+	}{
+		{
+			name:       "requires human cleared",
+			verdict:    ContributorLaneVerdict{Configured: true, Verdict: "requires_human"},
+			wantMerges: 1,
+		},
+		{
+			name:       "changes requested not cleared",
+			verdict:    ContributorLaneVerdict{Configured: true, Verdict: "changes_requested"},
+			wantReason: contributorLaneReasonNoVerdict,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fx := validContributorFixture()
+			fx.reviews = []map[string]any{{
+				"id": 1, "state": "APPROVED", "commit_id": "sha7", "user": map[string]string{"login": "clubanderson"},
+			}}
+			api := newContributorLaneAPI(t, &fx)
+			defer api.Close()
+			policy := defaultContributorLanePolicy()
+			clock := &contributorLaneClock{at: time.Date(2026, 10, 15, 13, 0, 0, 0, time.UTC)}
+			engine := newContributorLaneEngine(api.URL, policy, clock, Options{
+				ContributorLaneVerdict: func(string, int, string) ContributorLaneVerdict { return tt.verdict },
+				ContributorSoak:        soakedTracker(clock),
+			})
+			engine.SetMergerAuthorizer(func(login string) bool { return strings.EqualFold(login, "clubanderson") })
+			_, reason, err := engine.trySweepContributorLanePR(context.Background(), "widget", "acme", "widget", 7, policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reason != tt.wantReason || fx.merges != tt.wantMerges {
+				t.Fatalf("reason=%q merges=%d, want %q/%d", reason, fx.merges, tt.wantReason, tt.wantMerges)
+			}
+		})
 	}
 }
 
@@ -727,9 +772,21 @@ func TestTrySweepContributorLanePRAutoPromotion(t *testing.T) {
 		}
 		return history
 	}
+	// withMergeSHA stamps the merge commit a later revert PR can name.
+	withMergeSHA := func(pr map[string]any, sha string) map[string]any {
+		pr["merge_commit_sha"] = sha
+		return pr
+	}
+	// maintainerRevert is a merged revert PR by someone other than the author.
+	maintainerRevert := func(title, body string) map[string]any {
+		pr := mergedHistoryPR("maintainer", title)
+		pr["body"] = body
+		return pr
+	}
 	for _, tc := range []struct {
 		name         string
 		history      []map[string]any
+		registry     ContributorRegistryTierFunc
 		threshold    int
 		wantReason   string
 		wantMerges   int
@@ -739,6 +796,14 @@ func TestTrySweepContributorLanePRAutoPromotion(t *testing.T) {
 		{name: "below threshold stays untrusted", history: cleanHistory(4), threshold: 5, wantReason: contributorLaneReasonClaimTier},
 		{name: "revert blocks promotion", history: append(cleanHistory(2), mergedHistoryPR(contributorLaneTestAuthor, "Revert \"fix: clean change\"")), threshold: 3, wantReason: contributorLaneReasonClaimTier},
 		{name: "sentinel blocks promotion", history: append(cleanHistory(2), mergedHistoryPR(contributorLaneTestAuthor, "fix: risky", defaultSentinelLabel)), threshold: 3, wantReason: contributorLaneReasonClaimTier},
+		// A clean history never outranks the operator's explicit revocation.
+		{name: "revoked registry tier blocks promotion", history: cleanHistory(5), registry: registryTiers(map[string]string{contributorLaneTestAuthor: "revoked"}), threshold: 5, wantReason: contributorLaneReasonClaimTier},
+		{name: "other registry tier still promotes", history: cleanHistory(5), registry: registryTiers(map[string]string{contributorLaneTestAuthor: "contributor"}), threshold: 5, wantMerges: 1, wantComments: 2},
+		// The author's PR was undone by a maintainer's revert: evidence lives on
+		// the revert PR, not on the author's own title or labels.
+		{name: "sha-reverted history blocks promotion", history: append(append([]map[string]any{maintainerRevert("Revert \"something else\"", "This reverts commit abc1234def5678.")}, cleanHistory(2)...), withMergeSHA(mergedHistoryPR(contributorLaneTestAuthor, "fix: bad change"), "abc1234def56789012345678901234567890abcd")), threshold: 3, wantReason: contributorLaneReasonClaimTier},
+		{name: "title-reverted history blocks promotion", history: append(append([]map[string]any{maintainerRevert("Revert \"fix: bad change (#100)\"", "")}, cleanHistory(2)...), mergedHistoryPR(contributorLaneTestAuthor, "fix: bad change")), threshold: 3, wantReason: contributorLaneReasonClaimTier},
+		{name: "maintainer revert of someone else does not block", history: append([]map[string]any{maintainerRevert("Revert \"chore: unrelated\"", "This reverts commit 0000000.")}, cleanHistory(3)...), threshold: 3, wantMerges: 1, wantComments: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fx := validContributorFixture()
@@ -749,7 +814,7 @@ func TestTrySweepContributorLanePRAutoPromotion(t *testing.T) {
 			policy := defaultContributorLanePolicy()
 			policy.AutoPromoteAfterMergedPR = tc.threshold
 			clock := &contributorLaneClock{at: time.Date(2026, 10, 15, 13, 0, 0, 0, time.UTC)}
-			engine := newContributorLaneEngine(api.URL, policy, clock, Options{ContributorSoak: soakedTracker(clock)})
+			engine := newContributorLaneEngine(api.URL, policy, clock, Options{ContributorRegistryTier: tc.registry, ContributorSoak: soakedTracker(clock)})
 			event, reason, err := engine.trySweepContributorLanePR(context.Background(), "widget", "acme", "widget", 7, policy)
 			if err != nil {
 				t.Fatalf("err = %v", err)
@@ -764,7 +829,7 @@ func TestTrySweepContributorLanePRAutoPromotion(t *testing.T) {
 				t.Fatalf("comments = %d, want %d last=%q", fx.comments, tc.wantComments, fx.lastComment)
 			}
 			if tc.wantMerges > 0 {
-				if event.Tier != contributorLaneTier || !strings.Contains(fx.lastComment, "auto-promoted after 5 clean merged PRs") {
+				if event.Tier != contributorLaneTier || !strings.Contains(fx.lastComment, fmt.Sprintf("auto-promoted after %d clean merged PRs", tc.threshold)) {
 					t.Fatalf("event=%+v comment=%q", event, fx.lastComment)
 				}
 			}

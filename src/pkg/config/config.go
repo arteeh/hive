@@ -961,6 +961,11 @@ type ProjectConfig struct {
 	// polarity is Governor.Labels.Exempt, which wins on conflict. Absent/empty
 	// = no filtering, the pre-existing behavior. See IssueFilterConfig.
 	IssueFilter IssueFilterConfig `yaml:"issue_filter,omitempty"`
+	// AgentIssueDecisionPolicy is "resolve" (default) or "escalate". Resolve
+	// keeps Hive-authored issues actionable when the only parking reason is a
+	// non-risk engineering choice (sequencing, naming, numbering, config shape,
+	// or approach A vs B). Risk questions still park at stage/085.
+	AgentIssueDecisionPolicy string `yaml:"agent_issue_decision_policy,omitempty" json:"agent_issue_decision_policy,omitempty"`
 	// CheckoutsDir is a host-local directory holding one checkout per monitored
 	// repo, as "<CheckoutsDir>/<repo name>" — the bare name from Repos, without
 	// the org. It is how an operator supplies the per-repo checkout root the
@@ -1019,6 +1024,18 @@ type ProjectConfig struct {
 	LabelDrivenApprovalLabels  []string `yaml:"label_driven_approval_labels,omitempty" json:"label_driven_approval_labels,omitempty"`
 	LabelDrivenTrustOrgMembers *bool    `yaml:"label_driven_trust_org_members,omitempty" json:"label_driven_trust_org_members,omitempty"`
 	LabelDrivenTrustedBots     []string `yaml:"label_driven_trusted_bots,omitempty" json:"label_driven_trusted_bots,omitempty"`
+}
+
+const (
+	ProjectAgentIssueDecisionResolve  = "resolve"
+	ProjectAgentIssueDecisionEscalate = "escalate"
+)
+
+func (p ProjectConfig) EffectiveAgentIssueDecisionPolicy() string {
+	if strings.EqualFold(strings.TrimSpace(p.AgentIssueDecisionPolicy), ProjectAgentIssueDecisionEscalate) {
+		return ProjectAgentIssueDecisionEscalate
+	}
+	return ProjectAgentIssueDecisionResolve
 }
 
 const MaxWritingGuideBytes = 64 * 1024
@@ -8911,9 +8928,9 @@ type PlanMatchConfig struct {
 }
 
 // ContributorPRsConfig is the owner-only gate for lane-authored contributor
-// PRs. It is separate from fix_human_prs: that setting authorizes pushing
-// Hive-authored fixes to human PRs, while this one only authorizes GitHub's
-// update-branch API for fork PRs whose authoring pointer belongs to this hive.
+// PRs. It is separate from fix_human_prs: that legacy setting is retained for
+// audit/UI continuity, while this one only authorizes GitHub's update-branch
+// API for fork PRs whose authoring pointer belongs to this hive.
 type ContributorPRsConfig struct {
 	// BaseSync enables automatic update-branch attempts for fork PRs that are
 	// behind or dirty and have "allow edits by maintainers" on. Default off.
@@ -9170,7 +9187,9 @@ type ContributorTierAutoMergeConfig struct {
 	// AutoPromoteAfterMerged lets the contributor lane conservatively treat a
 	// contributor as trusted after this many recently merged PRs by the same
 	// author in the repository, provided that window has no reverts or sentinel
-	// alerts. 0/unset means DefaultContributorTierAutoPromoteAfterMerged;
+	// alerts — including reverts of those PRs merged by someone else — and
+	// the author is not `revoked` in the contributor registry. 0/unset means
+	// DefaultContributorTierAutoPromoteAfterMerged;
 	// negative disables the ratchet.
 	AutoPromoteAfterMerged int `yaml:"auto_promote_after_merged,omitempty" json:"auto_promote_after_merged,omitempty"`
 }
@@ -9560,12 +9579,12 @@ var reviewFixHumanPRsMigrationLogOnce sync.Once
 // MigrateReviewFixHumanPRs is the upgrade step for review.fix_human_prs
 // (hivecommons/hive#8421). Before that setting existed, review.all_authors
 // alone made the fixer agent push commits onto every changes_requested PR,
-// whoever opened it. A hive that ran that way must keep running that way
-// across the upgrade, so:
+// whoever opened it. The stored value is kept for audit/UI continuity even
+// though fix dispatch now still requires hive authorship, so:
 //
 //   - all_authors true and fix_human_prs never set: fix_human_prs becomes an
-//     explicit true, logged once, so the dashboard shows it ON and the operator
-//     can turn it off deliberately.
+//     explicit true, logged once, so the dashboard shows the legacy state and
+//     the operator can turn it off deliberately.
 //   - anything else (new hives, all_authors off): left nil, which reads as
 //     false. An explicit false is never touched.
 //
@@ -9578,7 +9597,7 @@ func (c *Config) MigrateReviewFixHumanPRs() bool {
 	enabled := true
 	c.Review.FixHumanPRs = &enabled
 	reviewFixHumanPRsMigrationLogOnce.Do(func() {
-		log.Printf("[config] migrating review.fix_human_prs: all_authors is on and fix_human_prs was never set, so it is now stored as true to keep this hive pushing review fixes to PRs its agents did not open (as it did before #8421). Turn it off under Features > Review Gate > Reviewers if that is not wanted.")
+		log.Printf("[config] migrating review.fix_human_prs: all_authors is on and fix_human_prs was never set, so it is now stored as true for audit/UI continuity. Review-fix pushes still require hive authorship; turn the legacy setting off under Features > Review Gate > Reviewers if it is not wanted.")
 	})
 	return true
 }
