@@ -574,7 +574,17 @@ func (m *Manager) tmuxSendEntersForAgent(agent *AgentProcess) error {
 			return nil
 		}
 		if err := m.tmuxSendKeysForAgent(agent, "Enter"); err != nil {
-			return err
+			if i == 0 {
+				return err
+			}
+			// The first Enter already submitted the line; a failed insurance
+			// Enter must not report the kick undeliverable and prompt a
+			// re-kick of an agent that is now working (#12858).
+			if m.logger != nil {
+				m.logger.Warn("repeat Enter failed after the first was accepted; treating the line as submitted",
+					"agent", agent.Name, "sent", i, "error", err)
+			}
+			return nil
 		}
 		if i < enterCount-1 {
 			time.Sleep(enterDelay)

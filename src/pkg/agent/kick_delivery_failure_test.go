@@ -73,6 +73,30 @@ func TestKickDeliveryWriteFailures(t *testing.T) {
 	}
 }
 
+// A failed insurance Enter after the first was accepted means the prompt was
+// submitted: the kick is recorded as delivered, not re-kicked as undeliverable.
+func TestKickFailedRepeatEnterStillCountsAsDelivered(t *testing.T) {
+	m, a, _ := kickLogTestManager(t, "")
+	enters := 0
+	termSeams(m).sendKeysErr = func(_ *AgentProcess, keys ...string) error {
+		if len(keys) == 1 && keys[0] == "Enter" {
+			enters++
+			if enters > 1 {
+				return errors.New("tmux transport unavailable")
+			}
+		}
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.deliverKickLocked(a, "task", "send-kick"); err != nil {
+		t.Fatalf("delivery error = %v after the first Enter was accepted", err)
+	}
+	if enters != 2 || a.KicksUndeliverable != 0 || a.LastKick == nil || len(a.KickHistory) != 1 {
+		t.Fatalf("enters=%d undeliverable=%d lastKick=%v history=%d", enters, a.KicksUndeliverable, a.LastKick, len(a.KickHistory))
+	}
+}
+
 func TestSendKickPropagatesFinalDeliveryFailure(t *testing.T) {
 	origExists := tmuxSessionExists
 	tmuxSessionExists = func(*Manager, *AgentProcess) bool { return true }
@@ -129,6 +153,9 @@ func TestKickWriteFailuresReportAndClearOnRecovery(t *testing.T) {
 	termSeams(m).sendLiteralErr = func(*AgentProcess, string) error { return errors.New("send failed") }
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Decision B on #12787: write failures only self-report once the
+	// busy-no-activity restart has already been attempted for this episode.
+	m.markBusyNoActivityRestartLocked(a, time.Now().Add(-time.Minute))
 	for i := 0; i < 3; i++ {
 		if err := m.deliverKickLocked(a, "task", "send-kick"); err == nil {
 			t.Fatal("failed send reported success")
@@ -152,8 +179,8 @@ func TestKickWriteFailuresReportAndClearOnRecovery(t *testing.T) {
 			t.Fatal("successful retry left repeated-failure evidence active")
 		}
 	}
-	if a.KicksUndeliverable != 0 || a.LastKick == nil || len(a.KickHistory) != 1 {
-		t.Fatal("successful retry did not clear failures and record exactly one kick")
+	if a.KicksUndeliverable != 0 || !a.busyNoActivityRestartAt.IsZero() || a.LastKick == nil || len(a.KickHistory) != 1 {
+		t.Fatal("successful retry did not clear failures and the stall-restart marker and record exactly one kick")
 	}
 }
 

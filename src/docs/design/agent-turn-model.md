@@ -99,8 +99,8 @@ text**, by two independent mechanisms:
 **The readiness gate before the next kick.**
 `waitForInputPromptForAgent` (`src/pkg/agent/manager_tmux.go:496`) polls
 `captureTmuxPaneForAgent` and returns once `paneShowsInputPrompt`
-(`src/pkg/agent/manager_pane_signals.go:343`) matches a per-backend marker string. `SendKick`
-calls it at `src/pkg/agent/manager_kick.go:102`. This gate is the only thing that
+(`src/pkg/agent/manager_pane_signals.go:413`) matches a per-backend marker string. `SendKick`
+calls it at `src/pkg/agent/manager_kick.go:178`. This gate is the only thing that
 stops hive typing a new prompt on top of an in-flight response.
 
 The gate is bounded by `inputPromptTimeout` (120s), which is why operator kicks
@@ -121,7 +121,7 @@ authenticated CLI is actually doing something.
 
 Stall recovery is likewise textual: `nudgeIfKickStalled`
 (`src/pkg/agent/manager_kick.go:907`) compares `paneContentHash(pane)` against
-`agent.lastInferKickPane` (`src/pkg/agent/manager_kick.go:880`), and
+`agent.lastInferKickPane` (`src/pkg/agent/manager_kick.go:883`), and
 `paneShowsActiveWork` (`src/pkg/agent/manager_kick.go:823`) matches a spinner or a
 token-counter marker.
 
