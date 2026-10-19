@@ -136,12 +136,12 @@ Kick *timing* lives in `pkg/governor`; kick *text* is built in `pkg/scheduler`.
 - `Governor.Evaluate` (`src/pkg/governor/governor.go:377`) calls it at
   `src/pkg/governor/governor.go:485` and returns the due list.
 - The driving loop is a single ticker in `main`:
-  `deps.newTicker(initialEvalInterval)` at `src/cmd/hive/main.go:5883`, loop at
-  `src/cmd/hive/main.go:6113`, evaluation via `deps.runEval` at
-  `src/cmd/hive/main.go:6032` (`runEvalCycle`, `src/cmd/hive/main.go:6697`),
-  message assembly via `sched.BuildKickMessagesWithSkips` at `src/cmd/hive/main.go:7121`
-  (`src/pkg/scheduler/kickmessage.go:260`), and delivery via
-  `agentMgr.SendKick` wired into `dispatchAgentKicks` at `src/cmd/hive/main.go:7226`.
+  `deps.newTicker(initialEvalInterval)` at `src/cmd/hive/main.go:5889`, loop at
+  `src/cmd/hive/main.go:6126`, evaluation via `deps.runEval` at
+  `src/cmd/hive/main.go:6045` (`runEvalCycle`, `src/cmd/hive/main.go:6710`),
+  message assembly via `sched.BuildKickMessagesWithSkips` at `src/cmd/hive/main.go:7138`
+  (`src/pkg/scheduler/kickmessage.go:261`), and delivery via
+  `agentMgr.SendKick` wired into `dispatchAgentKicks` at `src/cmd/hive/main.go:7241`.
 
 This matters for the RFC: the scheduler is already **stateless with respect to
 turns**. It does not hold a continuation, does not await turn *N* before

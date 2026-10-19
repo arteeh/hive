@@ -7124,7 +7124,11 @@ func runEvalCycle(
 	kickActionable := applyConvergenceKickAdmission(cfg, dashSrv, actionable, notifier, logger)
 
 	sched.SetLastActionable(kickActionable)
+	// The filter compacts agentsDue in place, so snapshot it first to report
+	// the targets it withholds alongside the other skips below.
+	dueBeforeDeferral := append([]string(nil), agentsDue...)
 	agentsDue = sched.FilterFirstScanDeferredAgents(agentsDue)
+	agentsSkipped = append(agentsSkipped, firstScanDeferredSkips(dueBeforeDeferral, agentsDue)...)
 	reviewPlan := planReviewDispatch(cfg, actionable, agentMgr, beadStores, logger)
 	auditWithheldReviewFixes(reviewPlan, dashSrv, logger)
 	applyHumanDecisionLabels(ctx, cfg, ghClient, actionable, reviewPlan, logger)
