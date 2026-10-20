@@ -3232,6 +3232,7 @@ func (b *boot) bootCollectorsWith(deps bootCollectorsDeps) {
 			b.ctx,
 			b.metricsCollector,
 			dashboard.WithContributeHub(b.dashSrv.ContributeHub()),
+			b.dashSrv.SupersessionStatusOption(),
 			dashboard.WithMergeVerdicts(mergeVerdicts),
 			dashboard.WithMergeLaneTakesAuthor(mergeLaneTakesAuthorFunc(b.cfg, b.ghClient)),
 		)
@@ -7747,6 +7748,7 @@ func runEvalCycle(
 		ctx,
 		metricsCollector,
 		dashboard.WithContributeHub(dashSrv.ContributeHub()),
+		dashSrv.SupersessionStatusOption(),
 		dashboard.WithMergeVerdicts(mergeVerdicts),
 		dashboard.WithMergeLaneTakesAuthor(mergeLaneTakesAuthorFunc(cfg, ghClient)),
 	)
