@@ -101,6 +101,9 @@ type IssueUnparkEvent struct {
 
 // IssueUnparkSweepOptions configures SweepIssueUnparkCommands.
 type IssueUnparkSweepOptions struct {
+	// PRApproveReply explains a PR approval using the merge engine's policy.
+	// It must not merge or change labels. nil leaves PRs to other handlers.
+	PRApproveReply func(context.Context, string, int, *gh.IssueComment) (string, error)
 	// MaxActions caps the issues written to in one pass. Zero means
 	// DefaultIssueUnparkSweepMaxActions.
 	MaxActions int
@@ -155,7 +158,7 @@ type IssueUnparkSweepResult struct {
 	// Unparked lists the issues whose parking labels were cleared.
 	Unparked []IssueUnparkEvent
 	// Replies counts answers posted that did not un-park: `/hive help`, and
-	// the hint left when a maintainer approves in prose.
+	// the hint left when a maintainer approves in prose, and PR approval replies.
 	Replies int
 	// LabelApproved lists the acceptances acted on via a configured approval
 	// label on label-driven repos (hivecommons/hive#11313).
@@ -186,7 +189,10 @@ func (r *IssueUnparkSweepResult) actions() int {
 // in project.issue_filter.hard_suppress_labels, the same set the dashboard's
 // "your turn" decision reads; needs_spec is never answered here.
 //
-// Eligibility is deliberately narrow and every failing case is ignored in
+// PR `/hive approve` replies are handled separately when PRApproveReply is
+// configured; they never remove issue parking labels.
+//
+// Issue eligibility is deliberately narrow and every failing case is ignored in
 // silence, so nobody can probe it: the commenter must be a person other than
 // this hive (isHumanAuthor), must hold write, maintain or admin on the repo
 // (checked live), the command must be on the comment's first line outside any
@@ -228,7 +234,19 @@ func (c *Client) SweepIssueUnparkCommands(ctx context.Context, opts IssueUnparkS
 			if result.actions() >= maxActions {
 				break
 			}
-			if issue == nil || issue.IsPullRequest() {
+			if issue == nil {
+				continue
+			}
+			if issue.IsPullRequest() {
+				if opts.PRApproveReply != nil && issue.GetComments() > 0 && !issue.GetUpdatedAt().Time.Before(cutoff) {
+					acted, err := c.replyPRApproveCommand(ctx, repo, owner, repoName, issue, cutoff, opts.PRApproveReply)
+					if err != nil {
+						return result, err
+					}
+					if acted {
+						result.Replies++
+					}
+				}
 				continue
 			}
 			labels := issueLabelNames(issue.Labels)

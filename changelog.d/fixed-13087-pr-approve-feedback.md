@@ -1,0 +1,1 @@
+- Hive now acknowledges `/hive approve` on pull requests once per command and explains ineligible or stale approvals without clearing hold labels. The `stage/085-needs-decision` comment names the lane's approval action, including when a maintainer must merge manually ([#13087](https://github.com/hivecommons/hive/issues/13087)).

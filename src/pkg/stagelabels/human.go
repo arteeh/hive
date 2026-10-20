@@ -151,6 +151,10 @@ func Holds(labels []string) []string {
 // Route is RouteHuman's answer.
 type Route struct {
 	Stage Stage
+	// Actions names the actual release steps supplied by the merge lane.
+	Actions []string
+	// ManualMerge means this lane has no unattended way past its rule.
+	ManualMerge bool
 	// Reasons explains the stage: what the author must fix (072/070), what
 	// a person must decide (085), what is still running (060). Empty for 090.
 	Reasons []string
@@ -338,7 +342,11 @@ func ReadyComment(r Route, blockedBy string) string {
 func DecisionComment(r Route) string {
 	var b strings.Builder
 	b.WriteString(DecisionCommentMarker)
-	b.WriteString("\nNeeds a decision, not a merge")
+	if r.ManualMerge {
+		b.WriteString("\nNeeds a manual merge decision")
+	} else {
+		b.WriteString("\nNeeds a decision, not a merge")
+	}
 	if len(r.Reasons) == 1 {
 		b.WriteString(": ")
 		b.WriteString(r.Reasons[0])
@@ -356,6 +364,12 @@ func DecisionComment(r Route) string {
 		b.WriteString(r.Summary)
 		b.WriteString(".")
 	}
-	b.WriteString("\n\n<sub>Clear the cause and the hive re-evaluates on its next pass; the stage moves to `" + ReadyForHumanMerge.Label() + "` or the merge queue on its own.</sub>")
+	if len(r.Actions) > 0 {
+		b.WriteString("\n\n**What to do:**\n\n")
+		for _, action := range r.Actions {
+			b.WriteString("- " + action + "\n")
+		}
+	}
+	b.WriteString("\n\n<sub>Hive re-evaluates on its next pass. Approval does not bypass CI, hold labels or other merge gates.</sub>")
 	return b.String()
 }

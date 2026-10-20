@@ -9795,7 +9795,22 @@ func runIssueUnparkSweepIfDue(ctx context.Context, ghClient *github.Client, cfg 
 	if lastRun != nil {
 		*lastRun = now
 	}
+	approveOpts := automerge.Options{
+		MergerAuthorizer:       trustedMergerFunc(cfg),
+		TrustedAuthorizer:      trustedAuthorFunc(cfg),
+		TrustedAuthorPolicy:    trustedAuthorPolicyFunc(cfg),
+		ContributorLanePolicy:  contributorLanePolicyFunc(cfg),
+		ContributorLaneVerdict: contributorLaneVerdictFunc(cfg, logger),
+		ReviewVerdictHold:      reviewVerdictHoldFunc(logger),
+	}
+	if cfg != nil {
+		approveOpts.RepoAutoMergeEnabled = cfg.RepoAutoMergeEnabled
+		approveOpts.HumanMergePaths = func(repo string) []string { return humanMergePathsFor(cfg, repo) }
+		approveOpts.TrustedBotAuthors = func() map[string]bool { return cfg.AutoMerge.TrustedBotAuthorSet() }
+	}
+	approveEngine := automerge.New(ghClient, approveOpts)
 	result, err := ghClient.SweepIssueUnparkCommands(ctx, github.IssueUnparkSweepOptions{
+		PRApproveReply:       approveEngine.PRApproveReply,
 		MaxActions:           github.DefaultIssueUnparkSweepMaxActions,
 		LabelDriven:          issueUnparkLabelDriven(cfg),
 		LabelApproval:        labelApprovalPolicyResolver(cfg),

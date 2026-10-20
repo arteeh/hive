@@ -241,3 +241,19 @@ comments within a bounded seven-day window and a per-sweep action cap. Agents ma
 still read issue threads directly in their prompts, but the deterministic label
 transition to `approved-direction` happens only when the sweep accepts
 `/hive approve` or `/hive decision <text>`.
+
+## PR approval command feedback
+
+Hive answers recent `/hive approve` comments on open PRs once per comment,
+including PRs without a parking label. Its reply acknowledges the decision
+or explains why the lane cannot use it: for example, the commenter is not a
+trusted merger on the contributor lane, the command predates the holding
+verdict, or there is no review hold to release. A trusted merger who authored
+a contributor-lane PR can express their decision by comment; an ordinary
+contributor cannot release their own PR.
+
+The acknowledgement does not merge the PR, remove labels, or bypass any
+merge gate. The lane records an eligible release when it consumes the
+command. `stage/085-needs-decision` comments name the action for that lane,
+including a GitHub **Approve** review when required, and explicitly identify
+manual-only merges such as workflow edits or configured human-merge paths.

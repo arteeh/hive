@@ -130,7 +130,46 @@ func (c *Engine) routeHuman(ctx context.Context, tracker *StageTracker, key stri
 	if stage == stagelabels.NeedsDecision {
 		cause = stagelabels.CauseDecision
 	}
-	return stagelabels.RouteHuman(c.humanEvidence(ctx, tracker, key, obs, cause, now))
+	evidence := c.humanEvidence(ctx, tracker, key, obs, cause, now)
+	route := stagelabels.RouteHuman(evidence)
+	if route.Stage == stagelabels.NeedsDecision {
+		route.Actions, route.ManualMerge = decisionActions(obs, evidence)
+	}
+	return route
+}
+
+// decisionActions names the operations that actually clear the observed
+// cause. A review approval never overrides a manual-only path rule or label.
+func decisionActions(obs stageObservation, e stagelabels.Evidence) ([]string, bool) {
+	switch obs.Reason {
+	case contributorLaneReasonWorkflowPath, contributorLaneReasonTestsRemoved, autoMergeReasonHumanMergePath:
+		return []string{"A maintainer must review and merge this PR manually; `/hive approve` and a GitHub Approve review cannot override this lane's manual-merge rule."}, true
+	}
+	var actions []string
+	if e.Verdict == stagelabels.VerdictRequiresHuman {
+		if obs.Lane == stageLaneSelf || obs.Lane == stageLaneContributor {
+			action := "After reading the verdict, the owner or a trusted merger can reply `/hive approve`, or a trusted merger can submit a GitHub **Approve** review, posted after the holding verdict."
+			if obs.Lane == stageLaneContributor {
+				action += " The PR author can use the reply if they are a trusted merger; an ordinary contributor cannot release their own PR."
+			}
+			actions = append(actions, action)
+		} else {
+			actions = append(actions, "Ask a trusted merger to submit a GitHub **Approve** review for the current head; this lane does not consume `/hive approve` replies.")
+		}
+	}
+	if e.Verdict == stagelabels.VerdictUnavailable {
+		actions = append(actions, "Configure a reviewer and wait for its verdict, or have a maintainer review and merge manually; `/hive approve` cannot supply a missing swarm verdict.")
+	}
+	if e.Sentinel {
+		actions = append(actions, "Resolve the sentinel alert and have a maintainer clear its label.")
+	}
+	for _, label := range e.Holds {
+		actions = append(actions, "Resolve the reason for `"+label+"`, then have a maintainer remove that label; `/hive approve` does not remove it.")
+	}
+	if len(actions) == 0 {
+		actions = append(actions, "A maintainer must resolve the lane condition named above or review and merge manually; `/hive approve` does not override that condition.")
+	}
+	return actions, false
 }
 
 // trustCause renders the trust reason for the 090 comment.
