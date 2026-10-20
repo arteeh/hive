@@ -623,7 +623,8 @@ func TestSupersessionCandidateClaims(t *testing.T) {
 
 func TestSweepSupersededOpenPRs_AuditsDetectionWithoutAutoClose(t *testing.T) {
 	event := SupersessionSweepEvent{Repo: autoCloseRepo, Number: 12, Author: "contributor", IssueRepo: autoCloseRepo, Issue: 3, CloserPR: 22}
-	body := renderSupersessionComment(event, supersessionCloser{Repo: event.IssueRepo, Number: 22, URL: "https://github.com/" + autoCloseOrg + "/" + autoCloseRepo + "/pull/22"}, "A different merged PR closed the claimed issue. Leaving this contributor PR open for a human to review.")
+	closer := supersessionCloser{Repo: event.IssueRepo, Number: 22, URL: "https://github.com/" + autoCloseOrg + "/" + autoCloseRepo + "/pull/22"}
+	body := renderSupersessionComment(event, closer, supersessionDecisionNotice(autoCloseOrg, closer, ""))
 	for _, existing := range []bool{false, true} {
 		t.Run(fmt.Sprintf("existing-notice=%t", existing), func(t *testing.T) {
 			pr := supersessionPRFixture{}
@@ -657,5 +658,35 @@ func TestSweepSupersededOpenPRs_KeptOpenDetection(t *testing.T) {
 		if len(res.Closed) != 0 || len(events) < 2 || events[0].Action != "detected-contributor" || events[1].Action != "kept-open" {
 			t.Fatalf("auto-close=%t: result=%+v events=%+v", enabled, res, events)
 		}
+	}
+}
+
+func TestSupersessionDecisionNotice(t *testing.T) {
+	closer := supersessionCloser{Repo: "o/r", Number: 334}
+	cases := []struct {
+		name, operator, note string
+		want                 []string
+		reject               []string
+	}{
+		{"duplicate", "owner", "", []string{"**Decision needed (@owner):**", "duplicate #334", "**close as superseded**", "file names, not contents"}, []string{"did not close it automatically"}},
+		{"duplicate with keep reason", "owner", "the author replied", []string{"**Decision needed (@owner):**", "**close as superseded**", "did not close it automatically: the author replied."}, nil},
+		{"extra files", "owner", supersessionReasonExtraFiles, []string{"**Decision needed (@owner):**", supersessionReasonExtraFiles, "**keep open**"}, []string{"close as superseded**"}},
+		{"kept open", "owner", supersessionReasonKeptOpen, []string{"An operator chose to keep this PR open", SupersessionKeepOpenLabel, "#334"}, []string{"Decision needed", "Recommended", "@owner"}},
+		{"no operator", "", "", []string{"**Decision needed (maintainers):**"}, []string{"@"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := supersessionDecisionNotice(tc.operator, closer, tc.note)
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Fatalf("notice missing %q: %q", w, got)
+				}
+			}
+			for _, r := range tc.reject {
+				if strings.Contains(got, r) {
+					t.Fatalf("notice must not contain %q: %q", r, got)
+				}
+			}
+		})
 	}
 }
