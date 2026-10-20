@@ -38,6 +38,10 @@ func TestSweepPRApproveReplies(t *testing.T) {
 			json.NewEncoder(w).Encode([]*gh.Issue{{Number: gh.Ptr(7), Comments: gh.Ptr(len(comments)), UpdatedAt: &gh.Timestamp{Time: now}, PullRequestLinks: &gh.PullRequestLinks{URL: gh.Ptr("pr")}}})
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/org/repo/issues/7/comments":
 			commentReads++
+			// Only comments updated since the cutoff are requested.
+			if since, err := time.Parse(time.RFC3339, r.URL.Query().Get("since")); err != nil || since.Before(now.Add(-7*24*time.Hour-time.Minute)) || since.After(now.Add(-7*24*time.Hour+time.Minute)) {
+				t.Errorf("since=%q err=%v", r.URL.Query().Get("since"), err)
+			}
 			if listFailed {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
@@ -84,15 +88,16 @@ func TestSweepPRApproveReplies(t *testing.T) {
 		t.Fatalf("unexpected command %d", cm.GetID())
 		return "", nil
 	}}
-	// Failed evidence reads cannot post or remember an answer.
+	// Failed evidence reads cannot post or remember an answer, and one PR's
+	// failure is skipped rather than aborting the sweep for later issues.
 	listFailed = true
-	if _, err := client.SweepIssueUnparkCommands(context.Background(), opts); err == nil || len(posted) != 0 {
-		t.Fatalf("failed list: err=%v posted=%v", err, posted)
+	if result, err := client.SweepIssueUnparkCommands(context.Background(), opts); err != nil || result.Skipped != 1 || len(posted) != 0 {
+		t.Fatalf("failed list: result=%+v err=%v posted=%v", result, err, posted)
 	}
 	listFailed = false
 	postFailed = true
-	if _, err := client.SweepIssueUnparkCommands(context.Background(), opts); err == nil || len(posted) != 0 {
-		t.Fatalf("failed post: err=%v posted=%v", err, posted)
+	if result, err := client.SweepIssueUnparkCommands(context.Background(), opts); err != nil || result.Skipped != 1 || len(posted) != 0 {
+		t.Fatalf("failed post: result=%+v err=%v posted=%v", result, err, posted)
 	}
 	postFailed = false
 	for pass, wantReplies := range []int{1, 1, 0} {

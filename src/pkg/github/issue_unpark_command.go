@@ -153,7 +153,8 @@ type IssueLabelApprovalEvent struct {
 type IssueUnparkSweepResult struct {
 	// Seen counts parked issues examined.
 	Seen int
-	// Skipped counts parked issues that carried no actionable command.
+	// Skipped counts parked issues that carried no actionable command, plus
+	// issues and PRs whose comment read or reply failed in this pass.
 	Skipped int
 	// Unparked lists the issues whose parking labels were cleared.
 	Unparked []IssueUnparkEvent
@@ -241,7 +242,12 @@ func (c *Client) SweepIssueUnparkCommands(ctx context.Context, opts IssueUnparkS
 				if opts.PRApproveReply != nil && issue.GetComments() > 0 && !issue.GetUpdatedAt().Time.Before(cutoff) {
 					acted, err := c.replyPRApproveCommand(ctx, repo, owner, repoName, issue, cutoff, opts.PRApproveReply)
 					if err != nil {
-						return result, err
+						// One PR's failure must not stop un-parking for the rest of the pass.
+						if c.logger != nil {
+							c.logger.Warn("unpark sweep skipped PR", "repo", repo, "pr", issue.GetNumber(), "error", err)
+						}
+						result.Skipped++
+						continue
 					}
 					if acted {
 						result.Replies++

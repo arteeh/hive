@@ -12,8 +12,11 @@ import (
 // pass. PRs never enter the issue unpark path: an approval cannot clear their
 // hold labels. The merge engine explains eligibility without authorizing a
 // merge. Replies share the issue command's durable, author-checked ID marker.
+// Only comments updated since the cutoff are read: a command older than that
+// is ignored anyway, and Hive's reply is always newer than the command it
+// answers, so the dedup markers stay visible.
 func (c *Client) replyPRApproveCommand(ctx context.Context, displayRepo, owner, repo string, issue *gh.Issue, cutoff time.Time, reply func(context.Context, string, int, *gh.IssueComment) (string, error)) (bool, error) {
-	comments, err := c.listIssueComments(ctx, owner, repo, issue.GetNumber())
+	comments, err := c.listIssueCommentsSince(ctx, owner, repo, issue.GetNumber(), cutoff)
 	if err != nil {
 		return false, err
 	}
