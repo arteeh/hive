@@ -181,13 +181,16 @@ const (
 	trackerNumberNeedsDecision = 85
 	// trackerNumberIssueDecision is the issue parking stage (045): a main
 	// issue-side stop, not a detour off the merge gate.
-	trackerNumberIssueDecision  = 45
-	trackerNumberReadyForHuman  = 90
-	trackerNumberPreMergeSoak   = 95
-	trackerNumberCoveredByPR    = 40
-	trackerNumberClaimed        = 20
-	trackerNumberPRInProgress   = 30
-	trackerNumberActionable     = 10
+	trackerNumberIssueDecision = 45
+	trackerNumberReadyForHuman = 90
+	trackerNumberPreMergeSoak  = 95
+	trackerNumberCoveredByPR   = 40
+	trackerNumberClaimed       = 20
+	trackerNumberPRInProgress  = 30
+	trackerNumberActionable    = 10
+	// trackerNumberTriageNeeded is the untriaged-actionable stage (015): it
+	// lights the Actionable column with the word "Triage needed".
+	trackerNumberTriageNeeded   = 15
 	stageTrackerHistoryMaxItems = stagelabels.HistoryLimit
 )
 
@@ -198,6 +201,7 @@ const (
 	modHold          = "hold"
 	modNeedsHuman    = "needs-human"
 	modNeedsDecision = "needs-decision"
+	modNeedsTriage   = "needs-triage"
 	modNeedsRebase   = "needs-rebase"
 	modBlocked       = "blocked"
 	modDraft         = "draft"
@@ -241,6 +245,8 @@ func stageTrackerShort(s stagelabels.Stage) string {
 	switch s {
 	case stagelabels.Actionable:
 		return "Actionable"
+	case stagelabels.TriageNeeded:
+		return "Triage needed"
 	case stagelabels.Claimed:
 		return "Claimed"
 	case stagelabels.PRInProgress:
@@ -384,6 +390,10 @@ func stageTrackerModifiers(labels []string, hiveID string, rec stagelabels.Recor
 			// 045 on an issue, 085 on a PR); the retired spelling is read
 			// until migrated.
 			set[modNeedsDecision] = true
+		case "needs-triage":
+			// Still waiting on triage (reporter trust / maintainer look):
+			// the Open row's action chip reads "triage needed".
+			set[modNeedsTriage] = true
 		case "needs-rebase":
 			set[modNeedsRebase] = true
 		case "blocked":
@@ -405,7 +415,7 @@ func stageTrackerModifiers(labels []string, hiveID string, rec stagelabels.Recor
 		set[modDraft] = true
 	}
 	out := make([]string, 0, len(set))
-	for _, m := range []string{modStalled, modRegressed, modHold, modNeedsHuman, modNeedsDecision, modNeedsRebase, modBlocked, modDraft} {
+	for _, m := range []string{modStalled, modRegressed, modHold, modNeedsHuman, modNeedsDecision, modNeedsTriage, modNeedsRebase, modBlocked, modDraft} {
 		if set[m] {
 			out = append(out, m)
 		}
@@ -451,6 +461,12 @@ func humanizeStageReason(reason string) string {
 	}
 	if rest, ok := strings.CutPrefix(r, "optional-check-failing:"); ok {
 		return "optional check " + rest + " failing"
+	}
+	if rest, ok := strings.CutPrefix(r, "base-branch-red:"); ok {
+		return "waiting for the base branch's CI to recover (" + strings.ReplaceAll(rest, ",", ", ") + ") — not this PR's fault"
+	}
+	if rest, ok := strings.CutPrefix(r, "shared-ci-incident:"); ok {
+		return "deferred to shared-CI incident #" + rest + " — not this PR's fault"
 	}
 	if rest, ok := strings.CutPrefix(lower, "reviewer-verdict:"); ok {
 		switch rest {
@@ -527,6 +543,28 @@ func stageTrackerSoakRemaining(rec stagelabels.Record, now time.Time) time.Durat
 	return left
 }
 
+// adoptedWorkCaption names what the hive is doing on a PR it adopted in
+// place (stage 074) from the lane's reason token: the 074 label stays
+// whether the head is conflicted, red or awaiting rework, so the caption is
+// where "hive rebasing" vs "hive fixing CI" shows. Unknown reasons fall back
+// to the bare ownership sentence.
+func adoptedWorkCaption(reason string) string {
+	const owned = "Hive adopted this PR"
+	lower := strings.ToLower(strings.TrimSpace(reason))
+	switch {
+	case lower == "":
+		return owned
+	case lower == "conflicting" || lower == "not-mergeable" || strings.Contains(lower, "rebase"):
+		return owned + "; hive is rebasing it onto the base branch"
+	case strings.HasPrefix(lower, "check-failing:") || strings.HasPrefix(lower, "required-check-failing:") ||
+		strings.HasPrefix(lower, "optional-check-failing:") || lower == "ci-red" || lower == "check-runs":
+		return owned + "; hive is fixing CI"
+	case strings.HasPrefix(lower, "reviewer-verdict:") || strings.Contains(lower, "changes-requested") || strings.Contains(lower, "changes_requested"):
+		return owned + "; hive is addressing the review findings"
+	}
+	return owned
+}
+
 func joinClause(head, clause string) string {
 	if clause == "" {
 		return head
@@ -553,6 +591,8 @@ func stageTrackerCaption(stage stagelabels.Stage, reason, author string, kind st
 	switch stage {
 	case stagelabels.Actionable:
 		return joinClause("Triaged and eligible; waiting for the scanner to pick it up", clause), "scanner"
+	case stagelabels.TriageNeeded:
+		return joinClause("Actionable, but no maintainer has looked at it yet; waiting for triage", clause), "maintainer"
 	case stagelabels.Claimed:
 		return joinClause("Claimed; work is about to start", clause), "claimant"
 	case stagelabels.PRInProgress:
@@ -574,7 +614,7 @@ func stageTrackerCaption(stage stagelabels.Stage, reason, author string, kind st
 		}
 		return c, strings.TrimPrefix(who, "@")
 	case stagelabels.AdoptedByHive:
-		c := "Hive adopted this PR"
+		c := adoptedWorkCaption(reason)
 		if hasRec && rec.AdoptedBy > 0 {
 			c += " (superseded by #" + strconv.Itoa(rec.AdoptedBy) + ")"
 		}
@@ -696,6 +736,12 @@ func (s *Server) buildStageTracker(status *StatusPayload, store *stagelabels.Sto
 		// stage.
 		if stage == stagelabels.NeedsDecision || stage == stagelabels.IssueNeedsDecision {
 			it.Modifiers = slices.DeleteFunc(it.Modifiers, func(m string) bool { return m == modNeedsDecision })
+		}
+		// Likewise 015 says "Triage needed" itself; the needs-triage chip
+		// only adds information on another stage (a claimed or covered
+		// issue the gate is still holding).
+		if stage == stagelabels.TriageNeeded {
+			it.Modifiers = slices.DeleteFunc(it.Modifiers, func(m string) bool { return m == modNeedsTriage })
 		}
 		it.Caption, it.Actor = stageTrackerCaption(stage, it.Reason, it.Author, it.Kind, it.Mirrored, rec, hasRec, it.LinkedPR)
 		it.History = stageTrackerHistory(rec)
