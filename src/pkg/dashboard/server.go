@@ -189,6 +189,10 @@ type Server struct {
 	tokenHist *collect.TimeSeries[TokenSparklineEntry]
 	factHist  *collect.TimeSeries[FactHistoryEntry]
 	costHist  *collect.TimeSeries[CostHistoryEntry]
+	// costRollup holds per-UTC-day spend folded out of costHist so the Cost
+	// section can reach beyond the ring's ~30 days (see cost_rollup.go).
+	costRollupMu sync.Mutex
+	costRollup   map[string]CostDailyRollup
 	// budgetWindowHist records one row per CLOSED budget window (#4298). Lazily
 	// built like the sparkline rings so a zero-value Server works in tests.
 	budgetWindowOnce sync.Once
@@ -445,9 +449,15 @@ type StatusPayload struct {
 	// OverviewKPIIncomplete means at least one configured repo did not produce
 	// forge totals for this status snapshot, so Overview KPI history must not
 	// record it as a real point.
-	OverviewKPIIncomplete bool   `json:"overviewKPIIncomplete"`
-	Timestamp             string `json:"timestamp"`
-	TimeZone              string `json:"timeZone,omitempty"`
+	OverviewKPIIncomplete bool `json:"overviewKPIIncomplete"`
+	// StaleSince (RFC 3339) is set when any repo's counts and items are
+	// last-good figures rather than a fresh read: the previous enumeration
+	// kept after GitHub refused the fetch (#13382), or the forgestate cache's
+	// last-good open totals after a failed reconcile (#13376). The Overview
+	// says "stale since <t>" instead of showing zeros. Empty when fresh.
+	StaleSince string `json:"staleSince,omitempty"`
+	Timestamp  string `json:"timestamp"`
+	TimeZone   string `json:"timeZone,omitempty"`
 	// StatusSeq is a monotonic publish sequence (#4348): the frontend drops
 	// any status payload whose seq is older than the last one it rendered,
 	// so a stale in-flight poll/SSE response can never repaint over a newer
@@ -969,12 +979,21 @@ type FrontendSession struct {
 }
 
 type FrontendRepo struct {
-	Name             string                    `json:"name"`
-	Full             string                    `json:"full"`
-	Issues           int                       `json:"issues"`
-	PRs              int                       `json:"prs"`
-	Mode             string                    `json:"mode,omitempty"`
-	CountsIncomplete bool                      `json:"countsIncomplete,omitempty"`
+	Name             string `json:"name"`
+	Full             string `json:"full"`
+	Issues           int    `json:"issues"`
+	PRs              int    `json:"prs"`
+	Mode             string `json:"mode,omitempty"`
+	CountsIncomplete bool   `json:"countsIncomplete,omitempty"`
+	// CountsStale means this repo's counts are last-good figures: either the
+	// previous successful enumeration because GitHub refused this pass's fetch
+	// transiently (rate limit, 5xx; see github.ActionableResult.StaleRepos) or
+	// the forgestate cache's last-good open totals after a failed reconcile
+	// (hivecommons/hive#13376).
+	CountsStale bool `json:"countsStale,omitempty"`
+	// CountsStaleSince (RFC 3339) is when the stale figures were last read
+	// for real; set with CountsStale.
+	CountsStaleSince string                    `json:"countsStaleSince,omitempty"`
 	WorkBreakdown    *github.RepoWorkBreakdown `json:"workBreakdown,omitempty"`
 	SLA              *timeline.SLARepoReport   `json:"sla,omitempty"`
 	// ActionableIssues and OpenPrs are the items the agents may act on: the
@@ -3722,7 +3741,9 @@ func (s *Server) AppendCostHistoryFull(usd float64, agents map[string]float64, m
 	if len(models) > 0 {
 		entry.Models = models
 	}
-	s.costSeries().Append(entry)
+	if s.costSeries().Append(entry) {
+		s.foldCostRollups(time.UnixMilli(entry.Timestamp))
+	}
 }
 
 // CostHistory returns a copy of the estimated-cost history.
@@ -3733,6 +3754,7 @@ func (s *Server) CostHistory() []CostHistoryEntry {
 // SeedCostHistory restores persisted cost history on startup.
 func (s *Server) SeedCostHistory(entries []CostHistoryEntry) {
 	s.costSeries().Seed(entries)
+	s.foldCostRollups(time.Now())
 }
 
 // AppendTrendHistory samples the governor / per-repo / beads / system-gauge
@@ -3804,7 +3826,7 @@ func overviewKPISnapshotComplete(status *StatusPayload) bool {
 		return false
 	}
 	for _, repo := range status.Repos {
-		if repo.CountsIncomplete {
+		if repo.CountsIncomplete || repo.CountsStale {
 			return false
 		}
 	}

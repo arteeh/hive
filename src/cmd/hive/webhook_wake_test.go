@@ -2,6 +2,7 @@ package main
 
 import (
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -150,7 +151,11 @@ func TestRunLoopWithRunsAnEarlyCycleOnWebhookWake(t *testing.T) {
 	if len(h.evals) != 3 {
 		t.Fatalf("evals = %d, want first + webhook wake + cadence", len(h.evals))
 	}
-	if !strings.Contains(log.String(), "github webhook wake: running an early eval cycle") {
+	// The wake plans from the cached snapshot; only the cadence tick lists.
+	if want := []evalCycleSource{evalSourceEnumerate, evalSourceCached, evalSourceEnumerate}; !reflect.DeepEqual(h.sources, want) {
+		t.Fatalf("eval sources = %v, want %v", h.sources, want)
+	}
+	if !strings.Contains(log.String(), "github webhook wake: running an early eval cycle") || !strings.Contains(log.String(), "source=cached") {
 		t.Fatalf("log = %s", log.String())
 	}
 	snap := b.evalLoop.snapshot()
@@ -185,35 +190,48 @@ func TestEvalIntervalStretchesWhileWebhooksHealthy(t *testing.T) {
 	if got != 900*time.Second || mode != evalModeWebhook {
 		t.Fatalf("healthy webhooks: interval = %v mode = %q, want 900s webhook", got, mode)
 	}
-	if n := strings.Count(sb.String(), "github webhooks healthy"); n != 1 {
-		t.Fatalf("want one stale → healthy INFO line, got %d in %s", n, sb.String())
+	if n := strings.Count(sb.String(), "webhooks healthy; webhook cadence engaged"); n != 1 {
+		t.Fatalf("want one polling → webhook INFO line, got %d in %s", n, sb.String())
 	}
 	evalIntervalAndModeForConfig(cfg, nil, logger)
-	if n := strings.Count(sb.String(), "github webhooks healthy"); n != 1 {
+	if n := strings.Count(sb.String(), "webhooks healthy; webhook cadence engaged"); n != 1 {
 		t.Fatalf("healthy must be logged once per transition, got %d", n)
 	}
 
+	// A quiet repo (window lapsed, no GitHub activity seen) keeps the
+	// webhook cadence (#13381): silence alone is not degradation.
 	clock.Advance(2*120*time.Second + time.Second) // past the 2 × eval_interval_s window
 	got, mode = evalIntervalAndModeForConfig(cfg, nil, logger)
-	if got != 120*time.Second || mode != evalModePoll {
-		t.Fatalf("lapsed webhooks: interval = %v mode = %q, want 120s poll", got, mode)
-	}
-	if n := strings.Count(sb.String(), "github webhooks went stale"); n != 1 {
-		t.Fatalf("want one healthy → stale WARN line, got %d in %s", n, sb.String())
-	}
-	evalIntervalAndModeForConfig(cfg, nil, logger)
-	if n := strings.Count(sb.String(), "github webhooks went stale"); n != 1 {
-		t.Fatalf("an ongoing outage must be logged only once, got %d", n)
-	}
-
-	github.RecordWebhookEventForTest("org/repo")
-	got, mode = evalIntervalAndModeForConfig(cfg, nil, logger)
 	if got != 900*time.Second || mode != evalModeWebhook {
-		t.Fatalf("recovered webhooks: interval = %v mode = %q, want 900s webhook", got, mode)
+		t.Fatalf("lapsed but quiet: interval = %v mode = %q, want 900s webhook", got, mode)
 	}
-	evalIntervalAndModeForConfig(cfg, nil, logger)
-	if n := strings.Count(sb.String(), "github webhooks healthy"); n != 2 {
-		t.Fatalf("want one INFO for initial health and one for recovery, got %d", n)
+	// A poll that lists an item updated after the last delivery proves the
+	// silence was an outage: the cadence drops back to eval_interval_s.
+	github.RecordGitHubActivity(clock.Now())
+	got, mode = evalIntervalAndModeForConfig(cfg, nil, logger)
+	if got != 120*time.Second || mode != evalModePoll {
+		t.Fatalf("degraded webhooks: interval = %v mode = %q, want 120s poll", got, mode)
+	}
+	if n := strings.Count(sb.String(), "webhooks degraded; polling cadence restored"); n != 1 {
+		t.Fatalf("want one webhook → polling INFO line, got %d in %s", n, sb.String())
+	}
+	if snap := github.WebhookHealthSnapshot(); snap.Mode != github.WebhookModePolling || snap.Since == nil {
+		t.Fatalf("status webhooks block = %+v, want mode polling with since", snap.WebhookModeStatus)
+	}
+	// Recovery needs WebhookRecoveryHealthyWindows consecutive healthy
+	// windows, not one delivery.
+	github.RecordWebhookEventForTest("org/repo")
+	if got, mode = evalIntervalAndModeForConfig(cfg, nil, logger); mode != evalModePoll {
+		t.Fatalf("one delivery after a degradation: mode = %q interval = %v, want poll (hysteresis)", mode, got)
+	}
+	clock.Advance(100 * time.Second)
+	github.RecordWebhookEventForTest("org/repo")
+	clock.Advance(140 * time.Second) // ≥ one further window of uninterrupted health
+	if got, mode = evalIntervalAndModeForConfig(cfg, nil, logger); got != 900*time.Second || mode != evalModeWebhook {
+		t.Fatalf("recovered: interval = %v mode = %q, want 900s webhook", got, mode)
+	}
+	if n := strings.Count(sb.String(), "webhooks healthy; webhook cadence engaged"); n != 2 {
+		t.Fatalf("want a second polling → webhook INFO line on recovery, got %d in %s", n, sb.String())
 	}
 }
 
@@ -292,6 +310,7 @@ func TestRunLoopHealthRecheckResetsTickerWhenWebhooksLapse(t *testing.T) {
 	}
 
 	clock.Advance(121 * time.Second)
+	github.RecordGitHubActivity(clock.Now()) // a poll saw a change webhooks missed
 	health.fire()
 	cancel()
 	waitDone(t, done)
@@ -302,67 +321,10 @@ func TestRunLoopHealthRecheckResetsTickerWhenWebhooksLapse(t *testing.T) {
 	if mode := b.evalLoop.snapshot().Mode; mode != evalModePoll {
 		t.Fatalf("eval mode after lapse = %q, want poll", mode)
 	}
-	if !strings.Contains(log.String(), "github webhooks went stale") {
+	if !strings.Contains(log.String(), "webhooks degraded; polling cadence restored") {
 		t.Fatalf("log = %s", log.String())
 	}
 	if len(h.evals) != 1 {
 		t.Fatalf("health re-check must not run an eval cycle, evals = %d", len(h.evals))
-	}
-}
-
-// An outage must restore actual cadence cycles, and a subsequent delivery
-// must restore webhook pacing without restarting the process.
-func TestRunLoopWebhookOutagePollingAndRecovery(t *testing.T) {
-	clock := &lockedClock{now: time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)}
-	t.Cleanup(github.ResetWebhookTrackerForTestWithClock(clock.Now))
-	github.RecordWebhookEventForTest("org/repo")
-
-	b, log, cancel := newLoopBoot(t, 60, 0)
-	b.cfg.Governor.EvalIntervalWebhookS = 900
-	b.cfg.Governor.EvalIntervalMaxS = 1800
-	b.installWebhookWake()
-	gov, health := newFakeTicker(), newFakeTicker()
-	h := &loopHarness{startupOK: true, pending: []*fakeTicker{gov}, persisted: make(chan struct{}, 8)}
-	deps := h.deps()
-	deps.now = clock.Now
-	deps.newHealthTimer = func(d time.Duration) loopTicker { health.period = d; return health }
-	done := runLoopAsync(b, deps)
-	defer func() {
-		cancel()
-		waitDone(t, done)
-	}()
-	<-h.persisted
-	// Rendezvous after the initial health timer has been armed.
-	health.fire()
-	clock.Advance(121 * time.Second)
-	health.fire()
-	// The cadence tick rendezvous happens after the health handler resets
-	// the interval. No live processes or GitHub calls run in this harness.
-	gov.fire()
-	<-h.persisted
-	if snap := b.evalLoop.snapshot(); snap.Mode != evalModePoll || snap.IntervalS != 60 {
-		t.Fatalf("outage pacing = %+v, want poll at 60s", snap)
-	}
-
-	github.RecordWebhookEventForTest("org/repo")
-	b.webhookWaker.out <- webhookWakeBatch{Reason: "pull_request org/repo #7", Count: 1}
-	<-h.persisted
-	cancel()
-	waitDone(t, done)
-
-	if len(gov.resets) != 2 || gov.resets[0] != 60*time.Second || gov.resets[1] != 900*time.Second {
-		t.Fatalf("ticker resets = %v, want fallback to 60s then recovery to 900s", gov.resets)
-	}
-	if snap := b.evalLoop.snapshot(); snap.Mode != evalModeWebhook || snap.IntervalS != 900 || snap.WebhookWakes != 1 {
-		t.Fatalf("recovery pacing = %+v, want webhook at 900s and one wake", snap)
-	}
-	if len(health.resets) == 0 || health.resets[len(health.resets)-1] != 121*time.Second {
-		t.Fatalf("health timer resets = %v, want recovery to re-arm the health window", health.resets)
-	}
-	if len(h.evals) != 3 {
-		t.Fatalf("evals = %d, want startup + outage poll + recovery wake", len(h.evals))
-	}
-	if strings.Count(log.String(), "github webhooks went stale") != 1 || strings.Count(log.String(), "github webhooks healthy") != 2 {
-		t.Fatalf("want one outage and two healthy transitions: %s", log.String())
 	}
 }

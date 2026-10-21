@@ -89,7 +89,18 @@ type costResponse struct {
 	CountUpdatedAt   string `json:"count_updated_at,omitempty"`
 	CountStatus      string `json:"count_status,omitempty"`
 	CountStale       bool   `json:"count_stale,omitempty"`
-	CountAvailable   bool   `json:"count_available"`
+	// CountStaleSince is when the counts stopped being confirmed by GitHub
+	// (RFC 3339), set with CountStale (hivecommons/hive#13376).
+	CountStaleSince string `json:"count_stale_since,omitempty"`
+	// CountSource is "search" or "forgestate" (webhook-maintained counters
+	// reconciled against search hourly).
+	CountSource    string `json:"count_source,omitempty"`
+	CountAvailable bool   `json:"count_available"`
+	// DailyRollup is the per-UTC-day spend kept for ~2 years, ascending by
+	// day; the Cost section's chart uses it for buckets older than the
+	// 30-day snapshot ring (/api/cost/history). Empty until the first UTC
+	// day of snapshots has completed.
+	DailyRollup []CostDailyRollup `json:"daily_rollup"`
 }
 
 // costModelEntry is one row of the estimated per-model / per-agent breakdown.
@@ -196,6 +207,8 @@ func (s *Server) handleCost(w http.ResponseWriter, r *http.Request) {
 		resp.CountUpdatedAt = counts.UpdatedAt
 		resp.CountStatus = counts.Status
 		resp.CountStale = counts.Stale
+		resp.CountStaleSince = counts.StaleSince
+		resp.CountSource = counts.Source
 		if counts.WindowStart != "" {
 			if t, err := time.Parse(time.RFC3339, counts.WindowStart); err == nil {
 				resp.CountWindowStart = t.UnixMilli()
@@ -208,6 +221,7 @@ func (s *Server) handleCost(w http.ResponseWriter, r *http.Request) {
 		resp.CountWindowStart = s.costCountWindowStart()
 	}
 	resp.CountWindowEnd = time.Now().UnixMilli()
+	resp.DailyRollup = s.CostDailyRollups()
 
 	// --- Native cost per metered gateway ---
 	if s.deps != nil && s.deps.Config != nil {
