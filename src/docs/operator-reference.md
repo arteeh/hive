@@ -967,6 +967,10 @@ GraphQL query fails, or GitHub returns `mergeable: UNKNOWN` for that PR.
 
 ### Webhook-driven PR cache invalidation
 
+See [Webhooks: cadence, patching, and reconciliation](webhooks.md) for outage
+fallback timing, automatic recovery, and the current accuracy limits versus
+the ForgeState migration contract.
+
 A spoke accepts GitHub App webhooks on the public `POST /api/webhook/github`,
 either delivered directly by GitHub or relayed by the hub (the hub forwards the
 original signed body to the hive that manages the repository). The receiver

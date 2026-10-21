@@ -201,6 +201,20 @@ func TestEvalIntervalStretchesWhileWebhooksHealthy(t *testing.T) {
 	if n := strings.Count(sb.String(), "github webhooks went stale"); n != 1 {
 		t.Fatalf("want one healthy → stale WARN line, got %d in %s", n, sb.String())
 	}
+	evalIntervalAndModeForConfig(cfg, nil, logger)
+	if n := strings.Count(sb.String(), "github webhooks went stale"); n != 1 {
+		t.Fatalf("an ongoing outage must be logged only once, got %d", n)
+	}
+
+	github.RecordWebhookEventForTest("org/repo")
+	got, mode = evalIntervalAndModeForConfig(cfg, nil, logger)
+	if got != 900*time.Second || mode != evalModeWebhook {
+		t.Fatalf("recovered webhooks: interval = %v mode = %q, want 900s webhook", got, mode)
+	}
+	evalIntervalAndModeForConfig(cfg, nil, logger)
+	if n := strings.Count(sb.String(), "github webhooks healthy"); n != 2 {
+		t.Fatalf("want one INFO for initial health and one for recovery, got %d", n)
+	}
 }
 
 func TestWebhookHealthRecheckDelay(t *testing.T) {
@@ -293,5 +307,62 @@ func TestRunLoopHealthRecheckResetsTickerWhenWebhooksLapse(t *testing.T) {
 	}
 	if len(h.evals) != 1 {
 		t.Fatalf("health re-check must not run an eval cycle, evals = %d", len(h.evals))
+	}
+}
+
+// An outage must restore actual cadence cycles, and a subsequent delivery
+// must restore webhook pacing without restarting the process.
+func TestRunLoopWebhookOutagePollingAndRecovery(t *testing.T) {
+	clock := &lockedClock{now: time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)}
+	t.Cleanup(github.ResetWebhookTrackerForTestWithClock(clock.Now))
+	github.RecordWebhookEventForTest("org/repo")
+
+	b, log, cancel := newLoopBoot(t, 60, 0)
+	b.cfg.Governor.EvalIntervalWebhookS = 900
+	b.cfg.Governor.EvalIntervalMaxS = 1800
+	b.installWebhookWake()
+	gov, health := newFakeTicker(), newFakeTicker()
+	h := &loopHarness{startupOK: true, pending: []*fakeTicker{gov}, persisted: make(chan struct{}, 8)}
+	deps := h.deps()
+	deps.now = clock.Now
+	deps.newHealthTimer = func(d time.Duration) loopTicker { health.period = d; return health }
+	done := runLoopAsync(b, deps)
+	defer func() {
+		cancel()
+		waitDone(t, done)
+	}()
+	<-h.persisted
+	// Rendezvous after the initial health timer has been armed.
+	health.fire()
+	clock.Advance(121 * time.Second)
+	health.fire()
+	// The cadence tick rendezvous happens after the health handler resets
+	// the interval. No live processes or GitHub calls run in this harness.
+	gov.fire()
+	<-h.persisted
+	if snap := b.evalLoop.snapshot(); snap.Mode != evalModePoll || snap.IntervalS != 60 {
+		t.Fatalf("outage pacing = %+v, want poll at 60s", snap)
+	}
+
+	github.RecordWebhookEventForTest("org/repo")
+	b.webhookWaker.out <- webhookWakeBatch{Reason: "pull_request org/repo #7", Count: 1}
+	<-h.persisted
+	cancel()
+	waitDone(t, done)
+
+	if len(gov.resets) != 2 || gov.resets[0] != 60*time.Second || gov.resets[1] != 900*time.Second {
+		t.Fatalf("ticker resets = %v, want fallback to 60s then recovery to 900s", gov.resets)
+	}
+	if snap := b.evalLoop.snapshot(); snap.Mode != evalModeWebhook || snap.IntervalS != 900 || snap.WebhookWakes != 1 {
+		t.Fatalf("recovery pacing = %+v, want webhook at 900s and one wake", snap)
+	}
+	if len(health.resets) == 0 || health.resets[len(health.resets)-1] != 121*time.Second {
+		t.Fatalf("health timer resets = %v, want recovery to re-arm the health window", health.resets)
+	}
+	if len(h.evals) != 3 {
+		t.Fatalf("evals = %d, want startup + outage poll + recovery wake", len(h.evals))
+	}
+	if strings.Count(log.String(), "github webhooks went stale") != 1 || strings.Count(log.String(), "github webhooks healthy") != 2 {
+		t.Fatalf("want one outage and two healthy transitions: %s", log.String())
 	}
 }
