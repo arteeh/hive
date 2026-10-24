@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 
@@ -20,7 +21,8 @@ const (
 	ServeSocketEnvVar = "CRUX_SOCKET"
 	// ServerEnvVar is the address a `crux` client talks to instead of building
 	// an in-process runtime: `unix:///path`, an absolute socket path, or
-	// `host:port` / `http://host:port` for a TCP listener.
+	// `host:port` / `http://host:port` for loopback TCP, or `https://host:port`
+	// for a remote server behind a TLS-terminating reverse proxy.
 	ServerEnvVar = "CRUX_SERVER"
 	// ServeTokenEnvVar is the bearer token the server requires and the client
 	// presents. A TCP listener refuses to start without one.
@@ -44,20 +46,16 @@ const (
 type ServeConfig struct {
 	// Socket is the unix socket path. Empty selects DefaultServeSocket().
 	Socket string
-	// Listen is an optional TCP host:port. It is refused without a Token,
-	// and refused on a non-loopback host: the listener is plain http, so
-	// the token would cross the network in cleartext. Remote access goes
-	// through a TLS-terminating proxy that dials the loopback listener.
+	// Listen is an optional loopback TCP host:port. It requires a Token;
+	// remote access must use a TLS-terminating reverse proxy on loopback.
 	Listen string
 	// Token is the bearer token every request must carry. Optional on the
 	// socket (the file mode is the credential), required for Listen.
 	Token string
 }
 
-// Validate applies the defaults and the fail-closed rules: no TCP without a
-// token, and no TCP off loopback (the same rule the client applies in
-// api.ParseAddress: a bearer token travels over plain http only to the
-// local machine).
+// Validate applies the defaults and the fail-closed rules: TCP requires a
+// token and a loopback host because the listener serves plain HTTP.
 func (c *ServeConfig) Validate() error {
 	if c.Socket == "" {
 		c.Socket = DefaultServeSocket()
@@ -65,8 +63,14 @@ func (c *ServeConfig) Validate() error {
 	if c.Listen != "" && c.Token == "" {
 		return fmt.Errorf("a TCP listener on %s needs a bearer token (--token or %s); refusing to serve the runtime unauthenticated", c.Listen, ServeTokenEnvVar)
 	}
-	if c.Listen != "" && !api.LoopbackHost(c.Listen) {
-		return fmt.Errorf("listen %s: a TCP listener must bind a loopback address (127.0.0.1, [::1] or localhost); the listener is plain http and the bearer token would cross the network in cleartext — put a TLS-terminating proxy in front for remote access", c.Listen)
+	if c.Listen != "" {
+		host, _, err := net.SplitHostPort(c.Listen)
+		if err != nil {
+			return fmt.Errorf("listen address %q must be host:port: %w", c.Listen, err)
+		}
+		if !api.IsLoopbackHost(host) {
+			return fmt.Errorf("listen %s: a TCP listener must use a loopback host to protect the bearer token; use a TLS-terminating reverse proxy on loopback for remote access", c.Listen)
+		}
 	}
 	return nil
 }
